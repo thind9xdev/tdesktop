@@ -18,6 +18,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/window_filters_menu.h"
 #include "window/window_separate_id.h"
 #include "info/channel_statistics/earn/info_channel_earn_list.h"
+#include "info/peer_gifts/info_peer_gifts_widget.h"
+#include "info/stories/info_stories_widget.h"
 #include "info/info_memento.h"
 #include "info/info_controller.h"
 #include "inline_bots/bot_attach_web_view.h"
@@ -53,6 +55,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_peer_values.h"
 #include "data/data_premium_limits.h"
 #include "data/data_web_page.h"
+#include "dialogs/ui/chat_search_in.h"
 #include "passport/passport_form_controller.h"
 #include "chat_helpers/tabbed_selector.h"
 #include "chat_helpers/emoji_interactions.h"
@@ -180,6 +183,7 @@ private:
 	return {
 		.tonEmoji = Ui::Text::SingleCustomEmoji(
 			session->data().customEmojiManager().registerInternalEmoji(
+				u"collectible_ton_icon"_q,
 				Ui::Earn::IconCurrencyColored(
 					st::collectibleInfo.style.font,
 					st::collectibleInfo.textFg->c),
@@ -355,6 +359,14 @@ void DateClickHandler::onClick(ClickContext context) const {
 			window->showCalendar(strong, _date);
 		}
 	}
+}
+
+MessageHighlightId SearchHighlightId(const QString &query) {
+	auto result = MessageHighlightId{ .quote = { query } };
+	if (!result.quote.empty()) {
+		result.quoteOffset = kSearchQueryOffsetHint;
+	}
+	return result;
 }
 
 SessionNavigation::SessionNavigation(not_null<Main::Session*> session)
@@ -627,16 +639,25 @@ void SessionNavigation::showPeerByLinkResolved(
 		}
 	} else if (info.storyId) {
 		const auto storyId = FullStoryId{ peer->id, info.storyId };
+		const auto context = (info.storyAlbumId > 0)
+			? Data::StoriesContext{ Data::StoriesContextAlbum{
+				info.storyAlbumId,
+			} }
+			: Data::StoriesContext{ Data::StoriesContextSingle() };
 		peer->owner().stories().resolve(storyId, crl::guard(this, [=] {
 			if (peer->owner().stories().lookup(storyId)) {
 				parentController()->openPeerStory(
 					peer,
 					storyId.story,
-					Data::StoriesContext{ Data::StoriesContextSingle() });
+					context);
 			} else {
 				showToast(tr::lng_stories_link_invalid(tr::now));
 			}
 		}));
+	} else if (info.storyAlbumId > 0) {
+		showSection(Info::Stories::Make(peer, info.storyAlbumId));
+	} else if (info.giftCollectionId > 0) {
+		showSection(Info::PeerGifts::Make(peer, info.giftCollectionId));
 	} else if (bot && resolveType == ResolveType::BotApp) {
 		const auto itemId = info.clickFromMessageId;
 		const auto item = _session->data().message(itemId);
@@ -760,12 +781,26 @@ void SessionNavigation::showPeerByLinkResolved(
 			});
 		} else {
 			const auto draft = info.text;
+			const auto historyInNewWindow = info.historyInNewWindow;
 			params.videoTimestamp = info.videoTimestamp;
 			crl::on_main(this, [=] {
 				if (peer->isUser() && !draft.isEmpty()) {
 					Data::SetChatLinkDraft(peer, { draft });
 				}
-				showPeerHistory(peer, params, msgId);
+				if (historyInNewWindow) {
+					const auto window
+						= Core::App().ensureSeparateWindowFor(peer);
+					const auto controller = window
+						? window->sessionController()
+						: nullptr;
+					if (controller) {
+						controller->showPeerHistory(peer, params, msgId);
+					} else {
+						showPeerHistory(peer, params, msgId);
+					}
+				} else {
+					showPeerHistory(peer, params, msgId);
+				}
 			});
 		}
 	}
@@ -1013,14 +1048,14 @@ void SessionNavigation::applyBoost(
 			}
 			done({});
 		} else {
-			const auto weak = std::make_shared<QPointer<Ui::BoxContent>>();
+			const auto weak = std::make_shared<base::weak_qptr<Ui::BoxContent>>();
 			const auto reassign = [=](
 					std::vector<int> slots,
 					int groups,
 					int channels) {
 				const auto count = int(slots.size());
 				const auto callback = [=](Ui::BoostCounters counters) {
-					if (const auto strong = weak->data()) {
+					if (const auto strong = weak->get()) {
 						strong->closeBox();
 					}
 					done(counters);
@@ -1145,8 +1180,7 @@ void SessionNavigation::showRepliesForMessage(
 					.repliesRootId = rootId,
 				},
 				commentId,
-				params.highlightPart,
-				params.highlightPartOffsetHint);
+				params.highlight);
 			memento->setFromTopic(topic);
 			showSection(std::move(memento), params);
 			return;
@@ -1268,8 +1302,7 @@ void SessionNavigation::showSublist(
 			.sublist = sublist,
 		},
 		itemId,
-		params.highlightPart,
-		params.highlightPartOffsetHint);
+		params.highlight);
 	showSection(std::move(memento), params);
 }
 
@@ -1803,10 +1836,13 @@ void SessionController::activateFirstChatsFilter() {
 	setActiveChatsFilter(session().data().chatsFilters().defaultId());
 }
 
-bool SessionController::uniqueChatsInSearchResults() const {
+bool SessionController::uniqueChatsInSearchResults(
+		const Dialogs::SearchState &state) const {
+	const auto global = (state.tab == Dialogs::ChatSearchTab::MyMessages)
+		|| (state.tab == Dialogs::ChatSearchTab::PublicPosts);
 	return session().supportMode()
 		&& !session().settings().supportAllSearchResults()
-		&& !_searchInChat.current();
+		&& (global || !state.inChat);
 }
 
 bool SessionController::openFolderInDifferentWindow(
@@ -2924,7 +2960,7 @@ auto SessionController::stickerOrEmojiChosen() const
 	return _stickerOrEmojiChosen.events();
 }
 
-QPointer<Ui::BoxContent> SessionController::show(
+base::weak_qptr<Ui::BoxContent> SessionController::show(
 		object_ptr<Ui::BoxContent> content,
 		Ui::LayerOptions options,
 		anim::type animated) {
