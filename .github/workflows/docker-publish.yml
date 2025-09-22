@@ -12,8 +12,14 @@ on:
     branches: [ "dev" ]
     # Publish semver tags as releases.
     tags: [ 'v*.*.*' ]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/docker-publish.yml'
   pull_request:
     branches: [ "dev" ]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/docker-publish.yml'
 
 env:
   # Use docker.io for Docker Hub if empty
@@ -24,7 +30,7 @@ env:
 
 jobs:
   build:
-
+    name: Build Development Environment Image
     runs-on: ubuntu-latest
     permissions:
       contents: read

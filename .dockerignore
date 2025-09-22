@@ -1,0 +1,37 @@
+# Git and development files
+.git
+.gitignore
+.gitmodules
+.github
+.vscode
+.cursor
+.cursorignore
+
+# Build outputs
+out
+build
+cmake-build-*
+
+# Documentation
+docs
+*.md
+!README.md
+
+# Dependencies that will be built in container
+lib/build
+
+# Snap packaging
+snap
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+*.swp
+*.swo
+*~
+
+# Temporary files
+tmp
+temp
