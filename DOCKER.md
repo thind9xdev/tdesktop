@@ -2,6 +2,15 @@
 
 This repository provides Docker images to simplify building Telegram Desktop on Linux.
 
+## Quick Start
+
+**The fastest way to get started:**
+```bash
+./docker-quick-start.sh
+```
+
+This interactive script will guide you through the setup process and handle common issues automatically.
+
 ## Available Docker Images
 
 ### 1. Build Environment (`centos_env`)
