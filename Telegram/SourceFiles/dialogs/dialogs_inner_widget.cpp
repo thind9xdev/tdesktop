@@ -336,10 +336,9 @@ InnerWidget::InnerWidget(
 	) | rpl::start_with_next([=](
 			const Data::SendActionManager::AnimationUpdate &update) {
 		const auto updateRect = Ui::RowPainter::SendActionAnimationRect(
-			_st,
-			update.left,
-			update.width,
-			update.height,
+			update.thread,
+			_filterId,
+			update.rect,
 			width(),
 			update.textUpdated);
 		updateDialogRow(
@@ -374,9 +373,6 @@ InnerWidget::InnerWidget(
 	) | rpl::start_with_next([=](bool refreshHeight) {
 		if (refreshHeight) {
 			_chatsFilterTags.clear();
-		}
-		if (refreshHeight && _filterId) {
-			// Height of the main list will be refreshed in other way.
 			_shownList->updateHeights(_narrowRatio);
 		}
 		refreshWithCollapsedRows();
@@ -527,14 +523,25 @@ InnerWidget::InnerWidget(
 	) | rpl::start_with_next([=](
 			RowDescriptor previous,
 			RowDescriptor next) {
-		updateDialogRow(previous);
-		if (const auto sublist = previous.key.sublist()) {
-			updateDialogRow({ { sublist->owningHistory() }, {} });
-		}
-		updateDialogRow(next);
-		if (const auto sublist = next.key.sublist()) {
-			updateDialogRow({ { sublist->owningHistory() }, {} });
-		}
+		const auto update = [&](const RowDescriptor &descriptor) {
+			if (const auto topic = descriptor.key.topic()) {
+				if (_openedForum == topic->forum()) {
+					updateDialogRow(descriptor);
+				} else {
+					updateDialogRow({ { topic->owningHistory() }, {} });
+				}
+			} else if (const auto sublist = descriptor.key.sublist()) {
+				if (_savedSublists == sublist->parent()) {
+					updateDialogRow(descriptor);
+				} else {
+					updateDialogRow({ { sublist->owningHistory() }, {} });
+				}
+			} else {
+				updateDialogRow(descriptor);
+			}
+		};
+		update(previous);
+		update(next);
 	}, lifetime());
 
 	_controller->activeChatsFilter(
@@ -1478,7 +1485,7 @@ bool InnerWidget::isRowActive(
 		return true;
 	} else if (const auto topic = entry.key.topic()) {
 		if (const auto history = key.history()) {
-			return (history->peer == topic->channel())
+			return (history->peer == topic->peer())
 				&& HistoryView::SubsectionTabs::UsedFor(history);
 		}
 		return false;
@@ -3611,18 +3618,24 @@ void InnerWidget::trackResultsHistory(not_null<History*> history) {
 	if (!_trackedHistories.emplace(history).second) {
 		return;
 	}
-	const auto channel = history->peer->asChannel();
-	if (!channel || channel->isBroadcast()) {
+	const auto peer = history->peer;
+	if (!peer->isBot() && !peer->isMegagroup()) {
 		return;
 	}
-	channel->flagsValue(
-	) | rpl::skip(
-		1
-	) | rpl::filter([=](const ChannelData::Flags::Change &change) {
-		return (change.diff & ChannelDataFlag::Forum);
-	}) | rpl::start_with_next([=] {
+	auto changes = peer->isBot()
+		? peer->asBot()->flagsValue() | rpl::skip(
+			1
+		) | rpl::filter([=](const UserData::Flags::Change &change) {
+			return change.diff & UserDataFlag::Forum;
+		}) | rpl::to_empty | rpl::type_erased()
+		: peer->asChannel()->flagsValue() | rpl::skip(
+			1
+		) | rpl::filter([=](const ChannelData::Flags::Change &change) {
+			return (change.diff & ChannelDataFlag::Forum);
+		}) | rpl::to_empty | rpl::type_erased();
+	std::move(changes) | rpl::start_with_next([=] {
 		for (const auto &row : _searchResults) {
-			if (row->item()->history()->peer == channel) {
+			if (row->item()->history()->peer == peer) {
 				row->invalidateTopic();
 			}
 		}
@@ -3630,7 +3643,7 @@ void InnerWidget::trackResultsHistory(not_null<History*> history) {
 		for (auto i = begin(_filterResultsGlobal)
 			; i != end(_filterResultsGlobal);) {
 			if (const auto topic = i->first.topic()) {
-				if (topic->channel() == channel) {
+				if (topic->peer() == peer) {
 					removed = true;
 					_filterResults.erase(
 						ranges::remove(
@@ -3651,7 +3664,7 @@ void InnerWidget::trackResultsHistory(not_null<History*> history) {
 		update();
 	}, _trackedLifetime);
 
-	if (const auto forum = channel->forum()) {
+	if (const auto forum = peer->forum()) {
 		forum->topicDestroyed(
 		) | rpl::start_with_next([=](not_null<Data::ForumTopic*> topic) {
 			auto removed = false;
@@ -4284,7 +4297,7 @@ void InnerWidget::updateSearchIn() {
 	const auto peer = _searchState.inChat.owningHistory()
 		? _searchState.inChat.owningHistory()->peer.get()
 		: _openedForum
-		? _openedForum->channel().get()
+		? _openedForum->peer().get()
 		: nullptr;
 	const auto paused = [window = _controller] {
 		return window->isGifPausedAtLeastFor(Window::GifPauseReason::Any);
