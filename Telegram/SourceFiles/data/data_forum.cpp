@@ -32,7 +32,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "storage/storage_shared_media.h"
 #include "window/window_session_controller.h"
 #include "window/notifications_manager.h"
-#include "styles/style_boxes.h"
 
 namespace Data {
 namespace {
@@ -58,6 +57,17 @@ Forum::Forum(not_null<History*> history)
 	if (peer()->canCreateTopics()) {
 		owner().forumIcons().requestDefaultIfUnknown();
 	}
+	_topicsList.fullSize().value(
+	) | rpl::map([](int size) {
+		return size > 0;
+	}) | rpl::distinct_until_changed(
+	) | rpl::skip(
+		1
+	) | rpl::on_next([=] {
+		if (IsBotCreatesTopics(_history->peer)) {
+			_history->updateChatListEntryHeight();
+		}
+	}, _lifetime);
 }
 
 Forum::~Forum() {
@@ -527,6 +537,15 @@ MsgId Forum::reserveCreatingId(
 	return result;
 }
 
+ForumTopic *Forum::reserveNewBotTopic() {
+	const auto &colors = ForumTopicColorIds();
+	const auto colorId = colors[base::RandomIndex(colors.size())];
+	return topicFor(reserveCreatingId(
+		tr::lng_bot_new_chat(tr::now),
+		colorId,
+		DocumentId()));
+}
+
 void Forum::discardCreatingId(MsgId rootId) {
 	Expects(creating(rootId));
 
@@ -572,6 +591,12 @@ void Forum::clearAllUnreadMentions() {
 void Forum::clearAllUnreadReactions() {
 	for (const auto &[rootId, topic] : _topics) {
 		topic->unreadReactions().clear();
+	}
+}
+
+void Forum::clearAllUnreadPollVotes() {
+	for (const auto &[rootId, topic] : _topics) {
+		topic->unreadPollVotes().clear();
 	}
 }
 

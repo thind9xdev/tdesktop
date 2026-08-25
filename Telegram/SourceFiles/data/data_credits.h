@@ -73,6 +73,7 @@ struct CreditsHistoryEntry final {
 	uint64 bareGiftHostId = 0;
 	uint64 bareGiftReleasedById = 0;
 	uint64 bareGiftResaleRecipientId = 0;
+	uint64 bareGiftMessageAuthorId = 0;
 	uint64 bareActorId = 0;
 	uint64 bareEntryOwnerId = 0;
 	uint64 giftChannelSavedId = 0;
@@ -83,6 +84,7 @@ struct CreditsHistoryEntry final {
 	Fn<std::vector<CreditsHistoryEntry>()> pinnedSavedGifts;
 	uint64 nextToUpgradeStickerId = 0;
 	Fn<void()> nextToUpgradeShow;
+	Fn<void()> craftAnotherCallback;
 	CreditsAmount starrefAmount;
 	int starrefCommission = 0;
 	uint64 starrefRecipientId = 0;
@@ -118,8 +120,10 @@ struct CreditsHistoryEntry final {
 	bool giftUpgradeSeparate : 1 = false;
 	bool giftUpgradeGifted : 1 = false;
 	bool giftResale : 1 = false;
+	bool giftOffer : 1 = false;
 	bool giftResaleForceTon : 1 = false;
 	bool giftPinned : 1 = false;
+	bool giftCrafted : 1 = false;
 	bool savedToProfile : 1 = false;
 	bool fromGiftsList : 1 = false;
 	bool fromGiftSlug : 1 = false;

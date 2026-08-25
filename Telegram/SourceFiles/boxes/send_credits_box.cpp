@@ -38,13 +38,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/vertical_list.h"
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/peer_bubble.h"
-#include "styles/style_boxes.h"
 #include "styles/style_chat.h"
 #include "styles/style_credits.h"
 #include "styles/style_giveaway.h"
 #include "styles/style_info.h" // inviteLinkSubscribeBoxTerms
 #include "styles/style_layers.h"
-#include "styles/style_premium.h"
 #include "styles/style_settings.h"
 
 namespace Ui {
@@ -437,14 +435,14 @@ void SendCreditsBox(
 	};
 
 	const auto button = box->addButton(rpl::single(QString()), [=] {
-		const auto weak = base::make_weak(box.get());
 		Settings::MaybeRequestBalanceIncrease(
 			Main::MakeSessionShow(box->uiShow(), session),
 			form->invoice.credits,
 			SmallBalanceSourceFromForm(form),
 			[=](Settings::SmallBalanceResult result) {
 				if (result == Settings::SmallBalanceResult::Cancelled) {
-				} else if (result == Settings::SmallBalanceResult::Success) {
+				} else if (result == Settings::SmallBalanceResult::Success
+					|| result == Settings::SmallBalanceResult::Already) {
 					sendStars();
 				} else {
 					sent(result);

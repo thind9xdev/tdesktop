@@ -50,6 +50,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_layers.h"
 #include "styles/style_menu_icons.h"
 #include "styles/style_settings.h"
+#include "styles/style_stickers_box.h"
 
 namespace Settings {
 namespace {
@@ -180,11 +181,14 @@ FilterRowButton::FilterRowButton(
 : RippleButton(parent, st::defaultRippleAnimation)
 , _session(session)
 , _remove(this, st::filtersRemove)
-, _restore(this, tr::lng_filters_restore(), st::stickersUndoRemove)
-, _add(this, tr::lng_filters_recommended_add(), st::stickersTrendingAdd)
+, _restore(this, tr::lng_filters_restore(), st::settingsFilterAddRecommended)
+, _add(
+	this,
+	tr::lng_filters_recommended_add(),
+	st::settingsFilterAddRecommended)
 , _state(description.isEmpty() ? State::Normal : State::Suggested) {
-	_restore.setTextTransform(Ui::RoundButton::TextTransform::NoTransform);
-	_add.setTextTransform(Ui::RoundButton::TextTransform::NoTransform);
+	_restore.setFullRadius(true);
+	_add.setFullRadius(true);
 	setup(filter, description.isEmpty()
 		? ComputeCountString(session, filter)
 		: description);
@@ -360,7 +364,7 @@ struct FoldersState {
 	rpl::event_stream<bool> tagsButtonEnabled;
 };
 
-void SetupFoldersList(
+not_null<Ui::VerticalLayout*> SetupFoldersList(
 		not_null<Window::SessionController*> controller,
 		not_null<Ui::VerticalLayout*> container,
 		not_null<FoldersState*> state,
@@ -630,7 +634,7 @@ void SetupFoldersList(
 		auto removeRequests = std::vector<MTPmessages_UpdateDialogFilter>();
 		auto removeChatlistRequests = std::vector<MTPchatlists_LeaveChatlist>();
 
-		auto &realFilters = session->data().chatsFilters();
+		const auto &realFilters = session->data().chatsFilters();
 		const auto &list = realFilters.list();
 		order.reserve(state->rows.size());
 		for (auto &row : state->rows) {
@@ -765,13 +769,16 @@ void SetupFoldersList(
 			checkFinished();
 		});
 	};
+
+	return wrap;
 }
 
 void SetupRecommendedSection(
 		not_null<Window::SessionController*> controller,
 		not_null<Ui::VerticalLayout*> container,
 		not_null<FoldersState*> state,
-		HighlightRegistry *highlights) {
+		HighlightRegistry *highlights,
+		not_null<Ui::VerticalLayout*> filtersWrap) {
 	const auto session = &controller->session();
 	const auto limit = [=] {
 		return Data::PremiumLimits(session).dialogFiltersCurrent();
@@ -795,12 +802,9 @@ void SetupRecommendedSection(
 		return &*i;
 	};
 
-	const auto addFilter = [=, wrap = container->parentWidget()](
-			const Data::ChatFilter &filter) {
-		const auto outerWrap = static_cast<Ui::VerticalLayout*>(wrap);
-		const auto button = outerWrap->insert(
-			outerWrap->count() - 1,
-			object_ptr<FilterRowButton>(outerWrap, session, filter));
+	const auto addFilter = [=](const Data::ChatFilter &filter) {
+		const auto button = filtersWrap->add(
+			object_ptr<FilterRowButton>(filtersWrap, session, filter));
 		button->removeRequests(
 		) | rpl::on_next([=] {
 			const auto row = find(button);
@@ -839,6 +843,8 @@ void SetupRecommendedSection(
 		});
 		state->rows.push_back({ button, filter });
 		state->count = state->rows.size();
+
+		filtersWrap->resizeToWidth(container->width());
 		return button;
 	};
 
@@ -972,12 +978,17 @@ void BuildFoldersListSection(
 	builder.addSubsectionTitle(tr::lng_filters_subtitle());
 
 	builder.add([=](const WidgetContext &ctx) {
-		SetupFoldersList(ctx.controller, ctx.container, state, ctx.highlights);
-		SetupRecommendedSection(
+		const auto wrap = SetupFoldersList(
 			ctx.controller,
 			ctx.container,
 			state,
 			ctx.highlights);
+		SetupRecommendedSection(
+			ctx.controller,
+			ctx.container,
+			state,
+			ctx.highlights,
+			wrap);
 		return SectionBuilder::WidgetToAdd{};
 	});
 }
@@ -1108,7 +1119,6 @@ void BuildViewSection(SectionBuilder &builder) {
 		wrap->toggleOn(controller->enoughSpaceForFiltersValue());
 		const auto content = wrap->entity();
 
-		Ui::AddDivider(content);
 		Ui::AddSkip(content);
 		const auto title = Ui::AddSubsectionTitle(
 			content,
@@ -1139,8 +1149,6 @@ void BuildViewSection(SectionBuilder &builder) {
 			Core::App().settings().setChatFiltersHorizontal(value);
 			Core::App().saveSettingsDelayed();
 		});
-		Ui::AddSkip(content);
-		Ui::AddSkip(content);
 
 		return SectionBuilder::WidgetToAdd{};
 	}, [] {
@@ -1149,6 +1157,42 @@ void BuildViewSection(SectionBuilder &builder) {
 			.title = tr::lng_filters_view_subtitle(tr::now),
 			.keywords = { u"view"_q, u"layout"_q, u"tabs"_q },
 		};
+	});
+
+	builder.add([](const WidgetContext &ctx) {
+		const auto content = ctx.container;
+
+		Ui::AddSkip(content);
+		Ui::AddSubsectionTitle(
+			content,
+			tr::lng_filters_tabs_subtitle());
+
+		using Mode = Ui::ChatsFiltersTabsMode;
+		const auto modeGroup = std::make_shared<Ui::RadioenumGroup<Mode>>(
+			Core::App().settings().chatFiltersTabsMode());
+		const auto addMode = [&](Mode value, const QString &text) {
+			content->add(
+				object_ptr<Ui::Radioenum<Mode>>(
+					content,
+					modeGroup,
+					value,
+					text,
+					st::settingsSendType),
+				st::settingsSendTypePadding);
+		};
+		addMode(Mode::Default, tr::lng_filters_tabs_default(tr::now));
+		addMode(Mode::TextOnly, tr::lng_filters_tabs_text(tr::now));
+		addMode(Mode::TextAndIcons, tr::lng_filters_tabs_text_icons(tr::now));
+		addMode(Mode::IconsOnly, tr::lng_filters_tabs_icons(tr::now));
+
+		modeGroup->setChangedCallback([=](Mode value) {
+			Core::App().settings().setChatFiltersTabsMode(value);
+			Core::App().saveSettingsDelayed();
+		});
+		Ui::AddSkip(content);
+		Ui::AddSkip(content);
+
+		return SectionBuilder::WidgetToAdd{};
 	});
 }
 

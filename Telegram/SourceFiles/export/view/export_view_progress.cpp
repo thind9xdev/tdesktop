@@ -13,8 +13,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/fade_wrap.h"
 #include "ui/wrap/vertical_layout.h"
 #include "lang/lang_keys.h"
-#include "styles/style_boxes.h"
 #include "styles/style_export.h"
+#include "styles/style_widgets.h"
 
 namespace Export {
 namespace View {
@@ -297,7 +297,6 @@ rpl::producer<> ProgressWidget::doneClicks() const {
 }
 
 void ProgressWidget::setupBottomButton(not_null<Ui::RoundButton*> button) {
-	button->setTextTransform(Ui::RoundButton::TextTransform::NoTransform);
 	button->show();
 
 	sizeValue(

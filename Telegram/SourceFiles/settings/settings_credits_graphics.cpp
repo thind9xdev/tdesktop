@@ -18,6 +18,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "boxes/gift_premium_box.h"
 #include "boxes/share_box.h"
 #include "boxes/star_gift_box.h"
+#include "boxes/star_gift_craft_box.h"
 #include "boxes/star_gift_resale_box.h"
 #include "boxes/transfer_gift_box.h"
 #include "chat_helpers/stickers_gift_box_pack.h"
@@ -97,9 +98,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/vertical_layout.h"
 #include "ui/ui_utility.h"
 #include "window/window_session_controller.h"
+#include "styles/style_boxes.h"
 #include "styles/style_calls.h"
 #include "styles/style_channel_earn.h"
 #include "styles/style_chat.h"
+#include "styles/style_chat_helpers.h"
 #include "styles/style_credits.h"
 #include "styles/style_giveaway.h"
 #include "styles/style_info.h"
@@ -214,7 +217,9 @@ void ToggleStarGiftSaved(
 		if (const auto onstack = done) {
 			onstack(false);
 		}
-		show->showToast(error.type());
+		if (!Ui::ShowGiftErrorToast(show, error)) {
+			show->showToast(error.type());
+		}
 	}).send();
 }
 
@@ -270,7 +275,9 @@ void ConvertStarGift(
 				tr::rich));
 		done(true);
 	}).fail([=](const MTP::Error &error) {
-		show->showToast(error.type());
+		if (!Ui::ShowGiftErrorToast(show, error)) {
+			show->showToast(error.type());
+		}
 		done(false);
 	}).send();
 }
@@ -315,7 +322,7 @@ void AddViewMediaHandler(
 			fake.push_back(std::make_unique<Data::MediaPhoto>(
 				state->item,
 				owner->photo(item.id),
-				false)); // spoiler
+				Data::MediaPhoto::Args()));
 		} else {
 			const auto document = owner->document(item.id);
 			const auto item = state->item;
@@ -372,6 +379,44 @@ void AddViewMediaHandler(
 			state->over = false;
 		}
 	}, thumb->lifetime());
+}
+
+[[nodiscard]] PeerId SpendPurposePeerId(
+		not_null<Data::Session*> owner,
+		const SmallBalanceSource &source) {
+	const auto peerIfBotOrChannel = [&](PeerId id) -> PeerId {
+		if (!id) {
+			return PeerId();
+		}
+		const auto peer = owner->peer(id);
+		if (const auto broadcast = peer->monoforumBroadcast()) {
+			return broadcast->id;
+		} else if (!peer->isBot() && !peer->isChannel()) {
+			return PeerId();
+		}
+		return id;
+	};
+	return v::match(source, [](SmallBalanceBot value) {
+		return value.botId ? peerFromUser(value.botId) : PeerId();
+	}, [](SmallBalanceReaction value) {
+		return value.channelId ? peerFromChannel(value.channelId) : PeerId();
+	}, [&](SmallBalanceVideoStream value) {
+		return peerIfBotOrChannel(value.streamerId);
+	}, [](SmallBalanceSubscription) {
+		return PeerId();
+	}, [](SmallBalanceDeepLink) {
+		return PeerId();
+	}, [](SmallBalanceStarGift) {
+		return PeerId();
+	}, [&](SmallBalanceForMessage value) {
+		return peerIfBotOrChannel(value.recipientId);
+	}, [&](SmallBalanceForSuggest value) {
+		return peerIfBotOrChannel(value.recipientId);
+	}, [](SmallBalanceForOffer) {
+		return PeerId();
+	}, [](SmallBalanceForSearch) {
+		return PeerId();
+	});
 }
 
 } // namespace
@@ -456,7 +501,8 @@ void FillCreditOptions(
 		rpl::producer<> showFinishes,
 		rpl::producer<QString> subtitle,
 		std::vector<Data::CreditTopupOption> preloadedTopupOptions,
-		bool dark) {
+		bool dark,
+		PeerId spendPurposePeerId) {
 	const auto options = container->add(
 		object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
 			container,
@@ -650,6 +696,7 @@ void FillCreditOptions(
 					.amount = option.amount,
 					.extended = option.extended,
 					.giftPeerId = PeerId(option.giftBarePeerId),
+					.spendPurposePeerId = spendPurposePeerId,
 				};
 
 				const auto weak = base::make_weak(button);
@@ -963,6 +1010,25 @@ void ProcessReceivedSubscriptions(
 	// (owner->isChannel() && owner->asChannel()->canTransferGifts());
 }
 
+[[nodiscard]] bool CanCraftGift(
+		not_null<Main::Session*> session,
+		const Data::CreditsHistoryEntry &e) {
+	const auto unique = e.uniqueGift.get();
+	if (!unique || !unique->craftChancePermille) {
+		return false;
+	}
+	const auto owner = (unique && unique->ownerId)
+		? session->data().peer(unique->ownerId).get()
+		: nullptr;
+	return !owner
+		? false
+		: owner->isSelf()
+		? e.in
+		: false;
+	// Currently we're not crafting channel gifts.
+	// (owner->isChannel() && owner->asChannel()->canTransferGifts());
+}
+
 [[nodiscard]] bool ShowOfferBuyButton(
 		not_null<Main::Session*> session,
 		const Data::CreditsHistoryEntry &e) {
@@ -1066,7 +1132,11 @@ void FillUniqueGiftMenu(
 		const auto url = show->session().createInternalLinkFull(local);
 		menu->addAction(tr::lng_context_copy_link(tr::now), [=] {
 			TextUtilities::SetClipboardText({ url });
-			show->showToast(tr::lng_channel_public_link_copied(tr::now));
+			show->showToast({
+				.text = { tr::lng_channel_public_link_copied(tr::now) },
+				.iconLottie = u"toast/voip_invite"_q,
+				.iconLottieSize = st::toastLottieIconSize,
+			});
 		}, st.link ? st.link : &st::menuIconLink);
 
 		const auto shareBoxSt = st.shareBox;
@@ -1108,6 +1178,21 @@ void FillUniqueGiftMenu(
 		: owner;
 	if (!host) {
 		return;
+	}
+	if (CanCraftGift(&show->session(), e)) {
+		menu->addAction(tr::lng_gift_craft_menu_button(tr::now), [=] {
+			const auto unique = e.uniqueGift;
+			if (Ui::ShowCraftLaterError(show, unique)) {
+				return;
+			}
+			if (Ui::ShowCraftAddressError(show, unique)) {
+				return;
+			}
+			const auto savedId = EntryToSavedStarGiftId(&show->session(), e);
+			if (const auto window = show->resolveWindow()) {
+				Ui::ShowGiftCraftInfoBox(window, unique, savedId);
+			}
+		}, st.craft ? st.craft : &st::menuIconCraft);
 	}
 	const auto transfer = savedId
 		&& (savedId.isUser() ? e.in : savedId.chat()->canTransferGifts())
@@ -1204,6 +1289,7 @@ CreditsEntryBoxStyleOverrides DarkCreditsEntryBoxStyle() {
 		.share = &st::darkGiftShare,
 		.theme = &st::darkGiftTheme,
 		.transfer = &st::darkGiftTransfer,
+		.craft = &st::darkGiftCraft,
 		.wear = &st::darkGiftNftWear,
 		.takeoff = &st::darkGiftNftTakeOff,
 		.resell = &st::darkGiftNftResell,
@@ -1310,6 +1396,25 @@ void GenericCreditsEntryCover(
 		: e.barePeerId
 		? owner->peer(PeerId(e.barePeerId)).get()
 		: nullptr;
+	auto message = rpl::producer<Ui::UniqueGiftCoverMessage>();
+	if (uniqueGift && e.hasGiftComment && !e.description.empty()) {
+		auto sender = static_cast<PeerData*>(session->user().get());
+		auto hidden = true;
+		if (!e.anonymous && e.bareGiftMessageAuthorId) {
+			const auto loaded = owner->peerLoaded(
+				PeerId(e.bareGiftMessageAuthorId));
+			if (loaded && !loaded->isServiceUser()) {
+				sender = loaded;
+				hidden = false;
+			}
+		}
+		message = rpl::single(Ui::UniqueGiftCoverMessage{
+			.text = e.description,
+			.placeholder = QString(),
+			.sender = sender,
+			.hidden = hidden,
+		});
+	}
 	if (uniqueGift) {
 		const auto forceTon = e.giftResaleForceTon;
 		const auto cover = Ui::UniqueGiftCover{ *uniqueGift };
@@ -1323,13 +1428,18 @@ void GenericCreditsEntryCover(
 			}
 			: Fn<void()>();
 		AddUniqueGiftCover(content, rpl::single(cover), {
+			.numberText = (uniqueGift->number > 0)
+				? rpl::single(u"#"_q + Lang::FormatCountDecimal(uniqueGift->number))
+				: rpl::producer<QString>(),
 			.resalePrice = UniqueGiftResalePrice(e.uniqueGift, forceTon),
 			.resaleClick = resaleClick,
+			.message = std::move(message),
 		});
 		if (e.bareGiftOwnerId == session->userPeerId().value) {
 			if (const auto fromId = PeerId(e.barePeerId)) {
 				const auto from = session->data().peer(fromId);
-				AttachGiftSenderBadge(box, show, from, e.date);
+				const auto crafted = uniqueGift->crafted;
+				AttachGiftSenderBadge(box, show, from, e.date, crafted);
 			}
 		}
 	} else if (const auto callback = Ui::PaintPreviewCallback(session, e)) {
@@ -1380,7 +1490,7 @@ void GenericCreditsEntryCover(
 			? st::creditsHistoryEntryStarGiftSize
 			: st::creditsHistoryEntryGiftStickerSize));
 		const auto state = icon->lifetime().make_state<State>();
-		auto &packs = session->giftBoxStickersPacks();
+		const auto &packs = session->giftBoxStickersPacks();
 		const auto document = starGiftSticker
 			? starGiftSticker
 			: e.credits.ton()
@@ -1471,6 +1581,13 @@ void GenericCreditsEntryBox(
 void GenericCreditsEntryBody(
 		not_null<Ui::GenericBox*> box,
 		std::shared_ptr<ChatHelpers::Show> show,
+		const Data::CreditsHistoryEntry &e) {
+	GenericCreditsEntryBody(box, std::move(show), e, {}, nullptr, {});
+}
+
+void GenericCreditsEntryBody(
+		not_null<Ui::GenericBox*> box,
+		std::shared_ptr<ChatHelpers::Show> show,
 		const Data::CreditsHistoryEntry &e,
 		const Data::SubscriptionEntry &s,
 		std::shared_ptr<Data::GiftUpgradeSpinner> upgradeSpinner,
@@ -1554,10 +1671,24 @@ void GenericCreditsEntryBody(
 	if (uniqueGift) {
 		AddSkip(content, st::defaultVerticalListSkip * 2);
 
+		const auto canCraft = CanCraftGift(session, e);
+		const auto craft = canCraft ? [=] {
+			const auto unique = e.uniqueGift;
+			if (Ui::ShowCraftLaterError(show, unique)) {
+				return;
+			}
+			if (Ui::ShowCraftAddressError(show, unique)) {
+				return;
+			}
+			const auto savedId = EntryToSavedStarGiftId(&show->session(), e);
+			if (const auto window = show->resolveWindow()) {
+				Ui::ShowGiftCraftInfoBox(window, unique, savedId);
+			}
+		} : Fn<void()>();
 		AddUniqueCloseMoreButton(box, st, [=](not_null<Ui::PopupMenu*> menu) {
 			const auto type = SavedStarGiftMenuType::View;
 			FillUniqueGiftMenu(show, menu, e, type, st);
-		});
+		}, craft);
 
 		if (CanResellGift(session, e)) {
 			Ui::PreloadUniqueGiftResellPrices(session);
@@ -1588,6 +1719,8 @@ void GenericCreditsEntryBody(
 					? tr::lng_credits_box_history_entry_posts_search(tr::now)
 					: e.premiumMonthsForStars
 					? tr::lng_premium_summary_title(tr::now)
+					: e.giftOffer
+					? tr::lng_credits_box_history_entry_gift_offer(tr::now)
 					: !e.title.isEmpty()
 					? e.title
 					: e.starrefCommission
@@ -1606,7 +1739,9 @@ void GenericCreditsEntryBody(
 					: (isStarGift && !starGiftCanManage)
 					? tr::lng_gift_link_label_gift(tr::now)
 					: giftToSelf
-					? tr::lng_action_gift_self_subtitle(tr::now)
+					? ((uniqueGift && uniqueGift->crafted)
+						? tr::lng_action_gift_crafted_subtitle(tr::now)
+						: tr::lng_action_gift_self_subtitle(tr::now))
 					: e.gift
 					? tr::lng_credits_box_history_entry_gift_name(tr::now)
 					: (peer && !e.reaction)
@@ -2230,6 +2365,8 @@ void GenericCreditsEntryBody(
 			? tr::lng_credits_subscription_off_button()
 			: toRejoin
 			? tr::lng_credits_subscription_off_rejoin_button()
+			: e.craftAnotherCallback
+			? tr::lng_gift_craft_another_button()
 			: canUpgradeFree
 			? tr::lng_gift_upgrade_free()
 			: canUpgrade
@@ -2293,6 +2430,9 @@ void GenericCreditsEntryBody(
 				const auto close = crl::guard(box, [=] { box->closeBox(); });
 				showNextToUpgrade();
 				close();
+				return;
+			} else if (e.craftAnotherCallback) {
+				e.craftAnotherCallback();
 				return;
 			} else if (state->confirmButtonBusy.current()
 				|| state->convertButtonBusy.current()) {
@@ -2694,6 +2834,7 @@ Data::CreditsHistoryEntry SavedStarGiftEntry(
 		.bareGiftStickerId = data.info.document->id,
 		.bareGiftOwnerId = ownerId.value,
 		.bareGiftHostId = hostId.value,
+		.bareGiftMessageAuthorId = data.anonymous ? 0 : data.fromId.value,
 		.bareActorId = data.fromId.value,
 		.bareEntryOwnerId = chatGiftPeer ? chatGiftPeer->id.value : 0,
 		.giftChannelSavedId = data.manageId.chatSavedId(),
@@ -2717,6 +2858,7 @@ Data::CreditsHistoryEntry SavedStarGiftEntry(
 		.savedToProfile = !data.hidden,
 		.fromGiftsList = true,
 		.canUpgradeGift = data.upgradable,
+		.hasGiftComment = !data.message.empty(),
 		.in = data.mine,
 		.gift = true,
 	};
@@ -2805,6 +2947,9 @@ void ShowStarGiftViewBox(
 		.bareGiftHostId = hostId.value,
 		.bareGiftReleasedById = (data.stargiftReleasedBy
 			? data.stargiftReleasedBy->id.value
+			: 0),
+		.bareGiftMessageAuthorId = (data.messageAuthor
+			? data.messageAuthor->id.value
 			: 0),
 		.bareActorId = (toChannel ? data.channelFrom->id.value : 0),
 		.bareEntryOwnerId = (toChannel ? data.channel->id.value : 0),
@@ -3105,6 +3250,8 @@ void SmallBalanceBox(
 			}));
 	}();
 
+	const auto purposePeerId = SpendPurposePeerId(owner, source);
+
 	FillCreditOptions(
 		show,
 		box->verticalLayout(),
@@ -3114,7 +3261,8 @@ void SmallBalanceBox(
 		box->showFinishes(),
 		tr::lng_credits_summary_options_subtitle(),
 		{},
-		dark);
+		dark,
+		purposePeerId);
 
 	content->setMaximumHeight(st::creditsLowBalancePremiumCoverHeight);
 	content->setMinimumHeight(st::infoLayerTopBarHeight);
@@ -3232,13 +3380,12 @@ void AddWithdrawalWidget(
 		buttonsContainer,
 		rpl::never<QString>(),
 		stButton);
+	button->setTextTransform(Ui::RoundButtonTextTransform::ToUpper);
 
 	const auto buttonCredits = Ui::CreateChild<Ui::RoundButton>(
 		buttonsContainer,
 		tr::lng_bot_earn_balance_button_buy_ads(),
 		stButton);
-	buttonCredits->setTextTransform(
-		Ui::RoundButton::TextTransform::NoTransform);
 	{
 		const auto icon = Ui::CreateChild<Ui::RpWidget>(buttonCredits);
 		const auto &st = st::msgBotKbUrlIcon;
@@ -3304,8 +3451,13 @@ void AddWithdrawalWidget(
 					tr::lng_context_copy_link(tr::now),
 					[=, show = controller->uiShow()] {
 						TextUtilities::SetClipboardText({ urlState->url });
-						show->showToast(
-							tr::lng_channel_public_link_copied(tr::now));
+						show->showToast({
+							.text = {
+								tr::lng_channel_public_link_copied(tr::now),
+							},
+							.iconLottie = u"toast/voip_invite"_q,
+							.iconLottieSize = st::toastLottieIconSize,
+						});
 					},
 					&st::menuIconCopy);
 				urlState->menu->popup(QCursor::pos());
@@ -3540,6 +3692,12 @@ void MaybeRequestBalanceIncrease(
 			if (const auto onstack = done) {
 				onstack(SmallBalanceResult::Already);
 			}
+		} else if (session->appConfig().starsSpendTopupInvoiceDisabled()
+			&& SpendPurposePeerId(&session->data(), source)) {
+			show->showToast(tr::lng_credits_topup_disabled(tr::now));
+			if (const auto onstack = done) {
+				onstack(SmallBalanceResult::Blocked);
+			}
 		} else if (show->session().premiumPossible()) {
 			const auto success = [=] {
 				state->success = true;
@@ -3575,12 +3733,16 @@ void MaybeRequestBalanceIncrease(
 void AddUniqueCloseMoreButton(
 		not_null<Ui::GenericBox*> box,
 		Settings::CreditsEntryBoxStyleOverrides st,
-		Fn<void(not_null<Ui::PopupMenu*>)> fillMenu) {
+		Fn<void(not_null<Ui::PopupMenu*>)> fillMenu,
+		Fn<void()> launchCraft) {
 	const auto close = Ui::CreateChild<Ui::IconButton>(
 		box,
 		st::uniqueCloseButton);
 	const auto menu = fillMenu
 		? Ui::CreateChild<Ui::IconButton>(box, st::uniqueMenuButton)
+		: nullptr;
+	const auto craft = launchCraft
+		? Ui::CreateChild<Ui::IconButton>(box, st::uniqueCraftButton)
 		: nullptr;
 	close->show();
 	close->raise();
@@ -3588,12 +3750,23 @@ void AddUniqueCloseMoreButton(
 		menu->show();
 		menu->raise();
 	}
+	if (craft) {
+		craft->show();
+		craft->raise();
+	}
 	box->widthValue() | rpl::on_next([=](int width) {
-		close->moveToRight(0, 0, width);
+		auto right = 0;
+		close->moveToRight(right, 0, width);
 		close->raise();
+		right += close->width();
 		if (menu) {
-			menu->moveToRight(close->width(), 0, width);
+			menu->moveToRight(right, 0, width);
 			menu->raise();
+			right += menu->width();
+		}
+		if (craft) {
+			craft->moveToRight(right, 0, width);
+			craft->raise();
 		}
 	}, close->lifetime());
 	close->setClickedCallback([=] {
@@ -3616,6 +3789,9 @@ void AddUniqueCloseMoreButton(
 				(*state)->popup(QCursor::pos());
 			}
 		});
+	}
+	if (craft) {
+		craft->setClickedCallback(std::move(launchCraft));
 	}
 }
 

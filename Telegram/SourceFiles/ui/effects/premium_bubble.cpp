@@ -16,7 +16,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/padding_wrap.h"
 #include "ui/wrap/vertical_layout.h"
 #include "ui/painter.h"
-#include "styles/style_info_levels.h"
 #include "styles/style_layers.h"
 #include "styles/style_premium.h"
 
@@ -240,7 +239,6 @@ void Bubble::paintBubble(QPainter &p, const QRect &r, const QBrush &brush) {
 		p.drawPath(bubblePath(r));
 	}
 	p.setPen(st::activeButtonFg);
-	p.setFont(_st.font);
 	const auto withSubtext = !_subtext.isEmpty();
 	const auto height = withSubtext
 		? (_st.font->height

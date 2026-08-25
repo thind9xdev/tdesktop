@@ -25,7 +25,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/labels.h"
 #include "ui/basic_click_handlers.h"
-#include "styles/style_chat.h"
 #include "styles/style_chat_helpers.h"
 
 namespace HistoryView {
@@ -192,7 +191,6 @@ auto WithPinnedTitle(not_null<Main::Session*> session, PinnedId id) {
 	label->setTextColorOverride(stButton.textFg->c); // Use button's text color for label.
 	label->setAttribute(Qt::WA_TransparentForMouseEvents);
 
-	button->setTextTransform(Ui::RoundButton::TextTransform::NoTransform);
 	button->setFullRadius(true);
 	button->setClickedCallback(std::move(clickCallback));
 

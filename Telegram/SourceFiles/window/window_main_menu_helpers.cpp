@@ -37,50 +37,25 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_window.h"
 
 namespace Window {
-namespace {
-
-class VersionLabel final
-	: public Ui::FlatLabel
-	, public Ui::AbstractTooltipShower {
-public:
-	using Ui::FlatLabel::FlatLabel;
-
-	void clickHandlerActiveChanged(
-			const ClickHandlerPtr &action,
-			bool active) override {
-		update();
-		if (active && action && !action->dragText().isEmpty()) {
-			Ui::Tooltip::Show(1000, this);
-		} else {
-			Ui::Tooltip::Hide();
-		}
-	}
-
-	QString tooltipText() const override {
-		return u"Build date: %1."_q.arg(__DATE__);
-	}
-
-	QPoint tooltipPos() const override {
-		return QCursor::pos();
-	}
-
-	bool tooltipWindowActive() const override {
-		return Ui::AppInFocus() && Ui::InFocusChain(window());
-	}
-
-};
-
-} // namespace
 
 [[nodiscard]] not_null<Ui::FlatLabel*> AddVersionLabel(
 		not_null<Ui::RpWidget*> parent) {
-	return (Platform::IsMacStoreBuild() || Platform::IsWindowsStoreBuild())
-		? Ui::CreateChild<Ui::FlatLabel>(
-			parent.get(),
-			st::mainMenuVersionLabel)
-		: Ui::CreateChild<VersionLabel>(
-			parent.get(),
-			st::mainMenuVersionLabel);
+	const auto label = Ui::CreateChild<Ui::FlatLabel>(
+		parent.get(),
+		st::mainMenuVersionLabel);
+	if constexpr (!Platform::IsMacStoreBuild()
+		&& !Platform::IsWindowsStoreBuild()) {
+		Ui::InstallTooltip(label, [] {
+			if constexpr (Platform::IsLinux()) {
+				return u"Qt version: %1."_q.arg(QT_VERSION_STR);
+			} else {
+				return u"Build date: %1.\nQt version: %2."_q
+					.arg(__DATE__)
+					.arg(QT_VERSION_STR);
+			}
+		});
+	}
+	return label;
 }
 
 not_null<Ui::SettingsButton*> AddMyChannelsBox(
@@ -255,6 +230,7 @@ not_null<Ui::SettingsButton*> AddMyChannelsBox(
 		} else {
 			data.enumerateBroadcasts([&](not_null<ChannelData*> channel) {
 				if (channel->amCreator()
+					&& !channel->isCommunity()
 					&& !ranges::contains(ids, channel->id)) {
 					ids.push_back(channel->id);
 					add(channel, box->verticalLayout());
@@ -326,7 +302,7 @@ void SetupMenuBots(
 				continue;
 			} else if (const auto media = bot.media; !media->loaded()) {
 				if (!*iconLoadLifetime) {
-					auto &session = user->session();
+					const auto &session = user->session();
 					*iconLoadLifetime = session.downloaderTaskFinished(
 					) | rpl::on_next([=] {
 						if (media->loaded()) {

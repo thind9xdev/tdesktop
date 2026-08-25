@@ -21,12 +21,17 @@ struct PreparedList;
 enum class AlbumType;
 } // namespace Ui
 
+namespace Editor {
+struct PhotoModifications;
+} // namespace Editor
+
 namespace Storage {
 
 enum class MimeDataState {
 	None,
 	Files,
 	PhotoFiles,
+	MediaFiles,
 	//PremiumFile,
 	Image,
 };
@@ -46,21 +51,39 @@ enum class MimeDataState {
 [[nodiscard]] Ui::PreparedList PrepareMediaList(
 	const QList<QUrl> &files,
 	int previewWidth,
-	bool premium);
+	bool premium,
+	Fn<void(const Ui::PreparedList &)> errorCallback = nullptr);
 [[nodiscard]] Ui::PreparedList PrepareMediaList(
 	const QStringList &files,
 	int previewWidth,
-	bool premium);
+	bool premium,
+	Fn<void(const Ui::PreparedList &)> errorCallback = nullptr);
 [[nodiscard]] Ui::PreparedList PrepareMediaFromImage(
 	QImage &&image,
 	QByteArray &&content,
 	int previewWidth);
 void PrepareDetails(Ui::PreparedFile &file, int previewWidth, int sideLimit);
+struct VideoDetails {
+	QSize originalDimensions;
+	QSize shownDimensions;
+	QImage preview;
+};
+
+[[nodiscard]] VideoDetails ComputeVideoDetails(
+	const QImage &thumbnail,
+	const Editor::PhotoModifications &geometry,
+	int previewWidth,
+	int sideLimit);
+void ApplyVideoDetails(Ui::PreparedFile &file, VideoDetails &&details);
+void UpdateVideoDetails(
+	Ui::PreparedFile &file,
+	int previewWidth,
+	int sideLimit);
 void UpdateImageDetails(
 	Ui::PreparedFile &file,
 	int previewWidth,
 	int sideLimit);
 
-bool ApplyModifications(Ui::PreparedList &list);
+bool ApplyModifications(Ui::PreparedList &list, bool composeAnimated = false);
 
 } // namespace Storage

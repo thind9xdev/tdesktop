@@ -31,6 +31,8 @@ CountryCodeInput::CountryCodeInput(
 	QWidget *parent,
 	const style::InputField &st)
 : MaskedInputField(parent, st) {
+	setInputMethodHints(Qt::ImhDialableCharactersOnly
+		| Qt::ImhNoPredictiveText);
 }
 
 void CountryCodeInput::startErasing(QKeyEvent *e) {
@@ -111,6 +113,8 @@ PhonePartInput::PhonePartInput(
 	PhonePartInput::GroupsCallback groupsCallback)
 : MaskedInputField(parent, st/*, tr::lng_phone_ph(tr::now)*/)
 , _groupsCallback(std::move(groupsCallback)) {
+	setInputMethodHints(Qt::ImhDialableCharactersOnly
+		| Qt::ImhNoPredictiveText);
 }
 
 void PhonePartInput::paintAdditionalPlaceholder(QPainter &p) {
@@ -269,6 +273,9 @@ UsernameInput::UsernameInput(
 	const QString &val,
 	const QString &linkPlaceholder)
 : MaskedInputField(parent, st, std::move(placeholder), val) {
+	setInputMethodHints(Qt::ImhLatinOnly
+		| Qt::ImhNoAutoUppercase
+		| Qt::ImhNoPredictiveText);
 	setLinkPlaceholder(linkPlaceholder);
 }
 
@@ -278,6 +285,10 @@ void UsernameInput::setLinkPlaceholder(const QString &placeholder) {
 		setTextMargins(style::margins(_st.textMargins.left() + _st.style.font->width(_linkPlaceholder), _st.textMargins.top(), _st.textMargins.right(), _st.textMargins.bottom()));
 		setPlaceholderHidden(true);
 	}
+}
+
+void UsernameInput::setMaxLength(int maxLength) {
+	_maxLength = maxLength;
 }
 
 void UsernameInput::paintAdditionalPlaceholder(QPainter &p) {
@@ -302,8 +313,11 @@ void UsernameInput::correctValue(
 		if (newPos > 0) --newPos;
 	}
 	len -= from;
-	if (len > kMaxUsernameLength) {
-		len = kMaxUsernameLength + (now.at(from) == '@' ? 1 : 0);
+	const auto maxLength = (_maxLength > 0)
+		? _maxLength
+		: kMaxUsernameLength;
+	if (len > maxLength) {
+		len = maxLength + (now.at(from) == '@' ? 1 : 0);
 	}
 	for (int32 to = from + len; to > from;) {
 		--to;
@@ -325,6 +339,8 @@ PhoneInput::PhoneInput(
 : MaskedInputField(parent, st, std::move(placeholder), value)
 , _defaultValue(defaultValue)
 , _groupsCallback(std::move(groupsCallback)) {
+	setInputMethodHints(Qt::ImhDialableCharactersOnly
+		| Qt::ImhNoPredictiveText);
 	if (value.isEmpty()) {
 		clearText();
 	} else {

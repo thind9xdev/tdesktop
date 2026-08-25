@@ -7,26 +7,29 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "settings/settings_search.h"
 
+#include "base/event_filter.h"
 #include "core/application.h"
 #include "core/click_handler_types.h"
+#include "core/deep_links/deep_links_settings.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
 #include "settings/settings_builder.h"
 #include "settings/settings_common.h"
 #include "settings/settings_faq_suggestions.h"
+#include "settings/settings_recent_searches.h"
 #include "ui/painter.h"
 #include "ui/text/text_entity.h"
+#include "ui/toast/toast.h"
 #include "ui/search_field_controller.h"
 #include "ui/vertical_list.h"
 #include "ui/widgets/buttons.h"
+#include "ui/widgets/popup_menu.h"
 #include "ui/widgets/checkbox.h"
 #include "ui/widgets/fields/input_field.h"
 #include "ui/widgets/labels.h"
-#include "ui/wrap/padding_wrap.h"
 #include "ui/wrap/vertical_layout.h"
 #include "window/window_session_controller.h"
-#include "styles/style_info.h"
-#include "styles/style_layers.h"
+#include "styles/style_chat_helpers.h"
 #include "styles/style_menu_icons.h"
 #include "styles/style_settings.h"
 #include "styles/style_widgets.h"
@@ -108,6 +111,7 @@ void SetupCheckIcon(
 		st,
 		std::move(icon));
 	const auto button = buttonObj.release();
+	button->setPointerCursor(false);
 	if (checkIcon != Builder::SearchEntryCheckIcon::None) {
 		SetupCheckIcon(button, checkIcon, st);
 	}
@@ -144,37 +148,46 @@ void Search::setInnerFocus() {
 
 base::weak_qptr<Ui::RpWidget> Search::createPinnedToTop(
 		not_null<QWidget*> parent) {
-	_searchController = std::make_unique<Ui::SearchFieldController>("");
-	auto rowView = _searchController->createRowView(
-		parent,
-		st::infoLayerMediaSearch);
-	_searchField = rowView.field;
-
-	const auto searchContainer = Ui::CreateChild<Ui::FixedHeightWidget>(
-		parent.get(),
-		st::infoLayerMediaSearch.height);
-	const auto wrap = rowView.wrap.release();
-	wrap->setParent(searchContainer);
-	wrap->show();
-
-	searchContainer->widthValue(
-	) | rpl::on_next([=](int width) {
-		wrap->resizeToWidth(width);
-		wrap->moveToLeft(0, 0);
-	}, searchContainer->lifetime());
+	auto search = CreateSectionSearchRow(parent);
+	_searchController = std::move(search.controller);
+	const auto row = search.row;
+	_searchField = search.field;
+	_searchField->customUpDown(true);
 
 	_searchController->queryChanges() | rpl::on_next([=](QString &&query) {
-		if (_stepData) {
-			*_stepData = SearchSectionState{ query };
-		}
 		rebuildResults(std::move(query));
-	}, searchContainer->lifetime());
+	}, row->lifetime());
+
+	_searchField->submits(
+	) | rpl::on_next([=](Qt::KeyboardModifiers) {
+		const auto index = (_selected >= 0) ? _selected : 0;
+		if (index < int(_visibleButtons.size())) {
+			_visibleButtons[index]->clicked(
+				Qt::NoModifier,
+				Qt::LeftButton);
+		}
+	}, row->lifetime());
+
+	base::install_event_filter(_searchField, [=](not_null<QEvent*> e) {
+		if (e->type() != QEvent::KeyPress) {
+			return base::EventFilterResult::Continue;
+		}
+		const auto key = static_cast<QKeyEvent*>(e.get())->key();
+		if (key == Qt::Key_Up
+			|| key == Qt::Key_Down
+			|| key == Qt::Key_PageUp
+			|| key == Qt::Key_PageDown) {
+			handleKeyNavigation(key);
+			return base::EventFilterResult::Cancel;
+		}
+		return base::EventFilterResult::Continue;
+	}, lifetime());
 
 	if (!_pendingQuery.isEmpty()) {
-		_searchController->setQuery(base::take(_pendingQuery));
+		_searchField->setText(base::take(_pendingQuery));
 	}
 
-	return base::make_weak(not_null<Ui::RpWidget*>{ searchContainer });
+	return base::make_weak(row);
 }
 
 void Search::setupContent() {
@@ -193,6 +206,7 @@ void Search::setupContent() {
 		for (auto i = _faqStartIndex; i < int(_entries.size()); ++i) {
 			const auto it = _buttonCache.find(i);
 			if (it != _buttonCache.end()) {
+				_trackedButtons.remove(it->second);
 				delete it->second;
 				_buttonCache.erase(it);
 			}
@@ -232,17 +246,22 @@ void Search::setupCustomizations() {
 void Search::buildIndex() {
 	_entries.clear();
 	_firstLetterIndex.clear();
+	_entryIdToIndex.clear();
 
 	const auto &registry = Builder::SearchRegistry::Instance();
 	const auto rawEntries = registry.collectAll(&controller()->session());
 
 	_entries.reserve(rawEntries.size());
 	for (const auto &entry : rawEntries) {
+		const auto index = int(_entries.size());
 		auto indexed = IndexedEntry{
 			.entry = entry,
 			.terms = PrepareEntryWords(entry),
 			.depth = CalculateDepth(entry.section, registry),
 		};
+		if (!entry.id.isEmpty()) {
+			_entryIdToIndex[entry.id] = index;
+		}
 		_entries.push_back(std::move(indexed));
 	}
 
@@ -272,16 +291,205 @@ void Search::buildIndex() {
 	}
 }
 
-void Search::rebuildResults(const QString &query) {
-	for (auto i = 0, count = _list->count(); i != count; ++i) {
-		_list->widgetAt(i)->hide();
+void Search::clearSelection() {
+	if (_selected >= 0 && _selected < int(_visibleButtons.size())) {
+		_visibleButtons[_selected]->setSynteticOver(false);
 	}
-	_list->clear();
+	_selected = -1;
+}
+
+void Search::selectByKeyboard(int newSelected) {
+	const auto count = int(_visibleButtons.size());
+	if (!count) {
+		return;
+	}
+	newSelected = std::clamp(newSelected, 0, count - 1);
+	if (newSelected == _selected) {
+		return;
+	}
+	const auto applySelection = [&] {
+		for (auto i = 0; i < count; ++i) {
+			if (i != newSelected && _visibleButtons[i]->isOver()) {
+				_visibleButtons[i]->setSynteticOver(false);
+			}
+		}
+		_selected = newSelected;
+		_visibleButtons[_selected]->setSynteticOver(true);
+	};
+	applySelection();
+	RevealWidget(_visibleButtons[_selected]);
+	applySelection();
+}
+
+void Search::setupButtonMouseTracking(
+		not_null<Ui::SettingsButton*> button) {
+	if (!_trackedButtons.emplace(button).second) {
+		return;
+	}
+	button->events(
+	) | rpl::filter([](not_null<QEvent*> e) {
+		return e->type() == QEvent::Enter;
+	}) | rpl::on_next([=] {
+		if (_selected >= 0) {
+			clearSelection();
+		}
+	}, button->lifetime());
+}
+
+void Search::handleKeyNavigation(int key) {
+	constexpr auto kPageSkip = 5;
+	const auto startIndex = [&] {
+		if (_selected >= 0) {
+			return _selected;
+		}
+		for (auto i = 0; i < int(_visibleButtons.size()); ++i) {
+			if (_visibleButtons[i]->isOver()) {
+				return i;
+			}
+		}
+		return -1;
+	}();
+
+	if (key == Qt::Key_Down) {
+		selectByKeyboard((startIndex < 0) ? 0 : (startIndex + 1));
+	} else if (key == Qt::Key_Up) {
+		if (startIndex > 0) {
+			selectByKeyboard(startIndex - 1);
+		} else if (startIndex == 0) {
+			clearSelection();
+		}
+	} else if (key == Qt::Key_PageDown) {
+		selectByKeyboard((startIndex < 0) ? 0 : (startIndex + kPageSkip));
+	} else if (key == Qt::Key_PageUp) {
+		if (startIndex > 0) {
+			selectByKeyboard(startIndex - kPageSkip);
+		} else if (startIndex == 0) {
+			clearSelection();
+		}
+	}
+}
+
+not_null<Ui::SettingsButton*> Search::createEntryButton(
+		int entryIndex,
+		const QString &subtitle) {
+	const auto &indexed = _entries[entryIndex];
+	const auto &entry = indexed.entry;
+	const auto hasIcon = entry.icon.icon != nullptr;
+	const auto hasCheckIcon = !hasIcon
+		&& (entry.checkIcon != Builder::SearchEntryCheckIcon::None);
+
+	const auto it = _customizations.find(entry.id);
+	const auto custom = (it != _customizations.end())
+		? &it->second
+		: nullptr;
+
+	const auto &st = custom && custom->st
+		? *custom->st
+		: (hasIcon || hasCheckIcon)
+		? st::settingsSearchResult
+		: st::settingsSearchResultNoIcon;
+
+	const auto button = CreateSearchResultButtonRaw(
+		this,
+		entry.title,
+		subtitle,
+		st,
+		IconDescriptor{ entry.icon.icon },
+		(hasCheckIcon
+			? entry.checkIcon
+			: Builder::SearchEntryCheckIcon::None));
+
+	if (custom && custom->hook) {
+		custom->hook(button);
+	}
+
+	const auto controlId = entry.id;
+	const auto targetSection = entry.section;
+	const auto deeplink = entry.deeplink;
+	if (!deeplink.isEmpty() || targetSection || !controlId.isEmpty()) {
+		button->addClickHandler([=] {
+			bumpRecentEntry(controlId);
+			if (!deeplink.isEmpty()) {
+				Core::App().openLocalUrl(
+					deeplink,
+					QVariant::fromValue(ClickHandlerContext{
+						.sessionWindow = base::make_weak(controller()),
+					}));
+			} else {
+				if (!controlId.isEmpty()) {
+					controller()->setHighlightControlId(controlId);
+				}
+				showOtherMethod()(targetSection);
+			}
+		});
+	}
+	const auto copyLink = !deeplink.isEmpty()
+		? deeplink
+		: Core::DeepLinks::SettingsDeepLink(targetSection, controlId);
+	if (!copyLink.isEmpty() || !controlId.isEmpty()) {
+		base::install_event_filter(button, [=](not_null<QEvent*> e) {
+			if (e->type() != QEvent::ContextMenu) {
+				return base::EventFilterResult::Continue;
+			}
+			const auto inRecent = !controlId.isEmpty()
+				&& ranges::contains(
+					controller()->session().recentSettingsSearches().list(),
+					controlId);
+			if (copyLink.isEmpty() && !inRecent) {
+				return base::EventFilterResult::Continue;
+			}
+			_contextMenu = base::make_unique_q<Ui::PopupMenu>(
+				button,
+				st::popupMenuWithIcons);
+			if (!copyLink.isEmpty()) {
+				_contextMenu->addAction(
+					tr::lng_context_copy_link(tr::now),
+					[=] {
+						TextUtilities::SetClipboardText(
+							TextForMimeData::Simple(copyLink));
+						controller()->showToast({
+							.text = {
+								tr::lng_channel_public_link_copied(tr::now),
+							},
+							.iconLottie = u"toast/voip_invite"_q,
+							.iconLottieSize = st::toastLottieIconSize,
+						});
+					},
+					&st::menuIconLink);
+			}
+			if (inRecent) {
+				_contextMenu->addAction(
+					tr::lng_recent_remove(tr::now),
+					[=] {
+						controller()->session().recentSettingsSearches().remove(
+							controlId);
+						const auto query = _searchController
+							? _searchController->query()
+							: QString();
+						rebuildResults(query);
+					},
+					&st::menuIconDelete);
+			}
+			_contextMenu->popup(QCursor::pos());
+			return base::EventFilterResult::Cancel;
+		}, button->lifetime());
+	}
+
+	_buttonCache.emplace(entryIndex, button);
+	return button;
+}
+
+void Search::rebuildResults(const QString &query) {
+	_list->detachRows();
+	clearSelection();
+	_visibleButtons.clear();
 
 	const auto queryWords = TextUtilities::PrepareSearchWords(query);
 
 	if (queryWords.isEmpty()) {
+		rebuildRecentResults();
 		rebuildFaqResults();
+		_list->resizeToWidth(_list->width());
 		return;
 	}
 
@@ -343,7 +551,6 @@ void Search::rebuildResults(const QString &query) {
 				st::settingsSearchNoResults),
 			st::settingsSearchNoResultsPadding);
 	} else {
-		const auto showOther = showOtherMethod();
 		const auto &registry = Builder::SearchRegistry::Instance();
 		const auto faqSubtitle = tr::lng_settings_faq_subtitle(tr::now);
 		const auto weak = base::make_weak(controller());
@@ -356,50 +563,22 @@ void Search::rebuildResults(const QString &query) {
 
 			const auto cached = _buttonCache.find(entryIndex);
 			if (cached != _buttonCache.end()) {
-				const auto button = cached->second;
-				button->show();
-				_list->add(
-					object_ptr<Ui::SettingsButton>::fromRaw(button));
+				addButton(cached->second);
 				continue;
 			}
 
-			auto subtitle = QString();
 			if (isFaq) {
-				subtitle = faqSubtitle + u" > "_q + indexed.faqSection;
-			} else {
-				const auto parentsOnly = entry.id.isEmpty();
-				subtitle = registry.sectionPath(entry.section, parentsOnly);
-			}
-			const auto hasIcon = entry.icon.icon != nullptr;
-			const auto hasCheckIcon = !hasIcon
-				&& (entry.checkIcon != Builder::SearchEntryCheckIcon::None);
+				const auto subtitle = faqSubtitle
+					+ u" > "_q
+					+ indexed.faqSection;
+				const auto button = CreateSearchResultButtonRaw(
+					this,
+					entry.title,
+					subtitle,
+					st::settingsSearchResultNoIcon,
+					IconDescriptor{},
+					Builder::SearchEntryCheckIcon::None);
 
-			const auto it = _customizations.find(entry.id);
-			const auto custom = (it != _customizations.end())
-				? &it->second
-				: nullptr;
-
-			const auto &st = custom && custom->st
-				? *custom->st
-				: (hasIcon || hasCheckIcon)
-				? st::settingsSearchResult
-				: st::settingsSearchResultNoIcon;
-
-			const auto button = CreateSearchResultButtonRaw(
-				this,
-				entry.title,
-				subtitle,
-				st,
-				IconDescriptor{ entry.icon.icon },
-				(hasCheckIcon
-					? entry.checkIcon
-					: Builder::SearchEntryCheckIcon::None));
-
-			if (custom && custom->hook) {
-				custom->hook(button);
-			}
-
-			if (isFaq) {
 				const auto url = indexed.faqUrl;
 				button->addClickHandler([=] {
 					UrlClickHandler::Open(
@@ -408,49 +587,89 @@ void Search::rebuildResults(const QString &query) {
 							.sessionWindow = weak,
 						}));
 				});
-			} else {
-				const auto targetSection = entry.section;
-				const auto controlId = entry.id;
-				const auto deeplink = entry.deeplink;
-				button->addClickHandler([=] {
-					if (!deeplink.isEmpty()) {
-						Core::App().openLocalUrl(
-							deeplink,
-							QVariant::fromValue(ClickHandlerContext{
-								.sessionWindow = base::make_weak(controller()),
-							}));
-					} else {
-						controller()->setHighlightControlId(controlId);
-						showOther(targetSection);
-					}
-				});
-			}
 
-			_buttonCache.emplace(entryIndex, button);
-			_list->add(object_ptr<Ui::SettingsButton>::fromRaw(button));
+				_buttonCache.emplace(entryIndex, button);
+				addButton(button);
+			} else {
+				const auto parentsOnly = entry.id.isEmpty();
+				const auto subtitle = registry.sectionPath(
+					entry.section,
+					parentsOnly);
+				addButton(createEntryButton(entryIndex, subtitle));
+			}
 		}
 	}
 
 	_list->resizeToWidth(_list->width());
 }
 
-void Search::setStepDataReference(std::any &data) {
-	_stepData = &data;
-	if (_stepData->has_value()) {
-		const auto state = std::any_cast<SearchSectionState>(_stepData);
-		if (state && !state->query.isEmpty()) {
-			if (_searchController) {
-				_searchController->setQuery(state->query);
-			} else {
-				_pendingQuery = state->query;
-			}
+void Search::sectionSaveState(std::any &state) {
+	const auto query = _searchController
+		? _searchController->query()
+		: _pendingQuery;
+	if (!query.isEmpty()) {
+		state = SearchSectionState{ query };
+	}
+}
+
+void Search::sectionRestoreState(const std::any &state) {
+	const auto saved = std::any_cast<SearchSectionState>(&state);
+	if (saved && !saved->query.isEmpty()) {
+		if (_searchField) {
+			_searchField->setText(saved->query);
+		} else {
+			_pendingQuery = saved->query;
 		}
+	}
+}
+
+void Search::bumpRecentEntry(const QString &entryId) {
+	if (!entryId.isEmpty()) {
+		controller()->session().recentSettingsSearches().bump(entryId);
+	}
+}
+
+void Search::rebuildRecentResults() {
+	const auto &recentIds
+		= controller()->session().recentSettingsSearches().list();
+	if (recentIds.empty()) {
+		return;
+	}
+
+	const auto &registry = Builder::SearchRegistry::Instance();
+
+	auto added = false;
+	for (const auto &entryId : recentIds) {
+		const auto it = _entryIdToIndex.find(entryId);
+		if (it == _entryIdToIndex.end()) {
+			continue;
+		}
+		if (!added) {
+			Ui::AddSubsectionTitle(_list, tr::lng_recent_title());
+			added = true;
+		}
+		const auto entryIndex = it->second;
+		const auto cached = _buttonCache.find(entryIndex);
+		if (cached != _buttonCache.end()) {
+			addButton(cached->second);
+			continue;
+		}
+		const auto &entry = _entries[entryIndex].entry;
+		const auto parentsOnly = entry.id.isEmpty();
+		const auto subtitle = registry.sectionPath(
+			entry.section,
+			parentsOnly);
+		addButton(createEntryButton(entryIndex, subtitle));
 	}
 }
 
 void Search::rebuildFaqResults() {
 	if (_faqStartIndex >= int(_entries.size())) {
 		return;
+	}
+
+	if (!_visibleButtons.empty()) {
+		Ui::AddSubsectionTitle(_list, tr::lng_settings_faq());
 	}
 
 	const auto faqSubtitle = tr::lng_settings_faq_subtitle(tr::now);
@@ -461,9 +680,7 @@ void Search::rebuildFaqResults() {
 
 		const auto cached = _buttonCache.find(i);
 		if (cached != _buttonCache.end()) {
-			const auto button = cached->second;
-			button->show();
-			_list->add(object_ptr<Ui::SettingsButton>::fromRaw(button));
+			addButton(cached->second);
 			continue;
 		}
 
@@ -486,10 +703,15 @@ void Search::rebuildFaqResults() {
 		});
 
 		_buttonCache.emplace(i, button);
-		_list->add(object_ptr<Ui::SettingsButton>::fromRaw(button));
+		addButton(button);
 	}
+}
 
-	_list->resizeToWidth(_list->width());
+void Search::addButton(not_null<Ui::SettingsButton*> button) {
+	button->show();
+	_list->add(object_ptr<Ui::SettingsButton>::fromRaw(button));
+	_visibleButtons.push_back(button);
+	setupButtonMouseTracking(button);
 }
 
 } // namespace Settings

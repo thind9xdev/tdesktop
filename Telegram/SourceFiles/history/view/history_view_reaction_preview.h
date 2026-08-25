@@ -7,6 +7,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+class DocumentData;
+class PhotoData;
+
+namespace Ui {
+class DropdownMenu;
+class RpWidget;
+} // namespace Ui
+
 namespace Data {
 struct ReactionId;
 } // namespace Data
@@ -17,9 +25,36 @@ class SessionController;
 
 namespace HistoryView {
 
-[[nodiscard]] bool ShowReactionPreview(
+struct ReactionPreviewMenu {
+	Ui::DropdownMenu *menu = nullptr;
+	Fn<void()> refreshGeometry;
+
+	Fn<void()> hide;
+};
+
+bool ShowStickerPreview(
 	not_null<Window::SessionController*> controller,
 	FullMsgId origin,
-	Data::ReactionId reactionId);
+	not_null<DocumentData*> document,
+	Fn<void(not_null<Ui::DropdownMenu*>)> fillMenu = nullptr);
+
+bool ShowPhotoPreview(
+	not_null<Window::SessionController*> controller,
+	FullMsgId origin,
+	not_null<PhotoData*> photo,
+	Fn<void(not_null<Ui::DropdownMenu*>)> fillMenu = nullptr);
+
+void ShowWidgetPreview(
+	not_null<Window::SessionController*> controller,
+	Fn<void(not_null<Ui::RpWidget*>)> setupContent,
+	Fn<void(not_null<Ui::DropdownMenu*>)> fillMenu);
+
+bool ShowReactionPreview(
+	not_null<Window::SessionController*> controller,
+	FullMsgId origin,
+	Data::ReactionId reactionId,
+	bool emojiPreview = false,
+	Fn<void(ReactionPreviewMenu)> setupMenu = nullptr,
+	std::optional<QPoint> menuAnchorGlobal = std::nullopt);
 
 } // namespace HistoryView

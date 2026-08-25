@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "api/api_editing.h"
 #include "base/event_filter.h"
 #include "boxes/premium_preview_box.h"
+#include "chat_helpers/compose/compose_show.h"
 #include "chat_helpers/field_autocomplete.h"
 #include "chat_helpers/message_field.h"
 #include "chat_helpers/tabbed_panel.h"
@@ -29,11 +30,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history.h"
 #include "history/history_item.h"
 #include "history/view/controls/history_view_characters_limit.h"
+#include "history/view/controls/history_view_compose_ai_button.h"
 #include "history/view/history_view_message.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
 #include "media/clip/media_clip_reader.h"
+#include "menu/menu_checked_action.h"
 #include "menu/menu_send.h"
+#include "ui/controls/compose_ai_button_factory.h"
 #include "ui/controls/emoji_button.h"
 #include "ui/controls/emoji_button_factory.h"
 #include "ui/effects/spoiler_mess.h"
@@ -47,12 +51,95 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/popup_menu.h"
 #include "window/window_controller.h"
 #include "window/window_session_controller.h"
-#include "styles/style_boxes.h"
 #include "styles/style_chat_helpers.h"
+#include "styles/style_edit_peer_members.h"
 #include "styles/style_layers.h"
 #include "styles/style_menu_icons.h"
 
 namespace Ui {
+
+void SetupCaptionFieldInBox(
+		not_null<Ui::GenericBox*> box,
+		not_null<Window::SessionController*> controller,
+		not_null<Ui::InputField*> field,
+		PeerData *panelPeer,
+		Fn<bool(not_null<DocumentData*>)> allowWithoutPremium,
+		PremiumFeature premiumFeature) {
+	using Limit = HistoryView::Controls::CharactersLimitLabel;
+	struct State final {
+		base::unique_qptr<ChatHelpers::TabbedPanel> emojiPanel;
+		base::unique_qptr<Limit> charsLimitation;
+	};
+	const auto state = box->lifetime().make_state<State>();
+	const auto container = box->getDelegate()->outerContainer();
+	using Selector = ChatHelpers::TabbedSelector;
+	state->emojiPanel = base::make_unique_q<ChatHelpers::TabbedPanel>(
+		container,
+		controller,
+		object_ptr<Selector>(
+			nullptr,
+			controller->uiShow(),
+			Window::GifPauseReason::Layer,
+			Selector::Mode::EmojiOnly));
+	const auto emojiPanel = state->emojiPanel.get();
+	emojiPanel->setDesiredHeightValues(
+		1.,
+		st::emojiPanMinHeight / 2,
+		st::emojiPanMinHeight);
+	emojiPanel->hide();
+	emojiPanel->selector()->setCurrentPeer(
+		panelPeer ? panelPeer : controller->session().user());
+	emojiPanel->selector()->emojiChosen(
+	) | rpl::on_next([=](ChatHelpers::EmojiChosen data) {
+		Ui::InsertEmojiAtCursor(field->textCursor(), data.emoji);
+	}, field->lifetime());
+	emojiPanel->selector()->customEmojiChosen(
+	) | rpl::on_next([=](ChatHelpers::FileChosen data) {
+		const auto info = data.document->sticker();
+		if (info
+			&& info->setType == Data::StickersType::Emoji
+			&& !allowWithoutPremium(data.document)
+			&& !controller->session().premium()) {
+			ShowPremiumPreviewBox(controller, premiumFeature);
+		} else {
+			Data::InsertCustomEmoji(field, data.document);
+		}
+	}, field->lifetime());
+
+	const auto emojiButton = Ui::AddEmojiToggleToField(
+		field,
+		box,
+		controller,
+		emojiPanel,
+		st::sendGifWithCaptionEmojiPosition);
+	emojiButton->show();
+
+	const auto session = &controller->session();
+	const auto checkCharsLimitation = [=](auto repeat) -> void {
+		const auto remove = Ui::ComputeFieldCharacterCount(field)
+			- Data::PremiumLimits(session).captionLengthCurrent();
+		if (remove > 0) {
+			if (!state->charsLimitation) {
+				state->charsLimitation = base::make_unique_q<Limit>(
+					field,
+					emojiButton,
+					style::al_top);
+				state->charsLimitation->show();
+				Data::AmPremiumValue(session) | rpl::on_next([=] {
+					repeat(repeat);
+				}, state->charsLimitation->lifetime());
+			}
+			state->charsLimitation->setLeft(remove);
+			state->charsLimitation->show();
+		} else {
+			state->charsLimitation = nullptr;
+		}
+	};
+	field->changes() | rpl::on_next([=] {
+		checkCharsLimitation(checkCharsLimitation);
+	}, field->lifetime());
+}
+
 namespace {
 
 struct State final {
@@ -174,10 +261,9 @@ struct State final {
 			const auto menu = Ui::CreateChild<Ui::PopupMenu>(
 				widget,
 				st::popupMenuWithIcons);
-			menu->addAction(
-				state->hasSpoiler
-					? tr::lng_context_disable_spoiler(tr::now)
-					: tr::lng_context_spoiler_effect(tr::now),
+			::Menu::AddCheckedAction(
+				menu,
+				tr::lng_context_spoiler_effect(tr::now),
 				[=] {
 					state->hasSpoiler = !state->hasSpoiler;
 					if (!state->hasSpoiler) {
@@ -190,9 +276,8 @@ struct State final {
 					}
 					widget->update();
 				},
-				state->hasSpoiler
-					? &st::menuIconSpoilerOff
-					: &st::menuIconSpoiler);
+				&st::menuIconSpoiler,
+				state->hasSpoiler);
 			menu->popup(QCursor::pos());
 			return base::EventFilterResult::Cancel;
 		}
@@ -205,8 +290,6 @@ struct State final {
 [[nodiscard]] not_null<Ui::InputField*> AddInputField(
 		not_null<Ui::GenericBox*> box,
 		not_null<Window::SessionController*> controller) {
-	using Limit = HistoryView::Controls::CharactersLimitLabel;
-
 	const auto bottomContainer = box->setPinnedToBottomContent(
 		object_ptr<Ui::VerticalLayout>(box));
 	const auto wrap = bottomContainer->add(
@@ -218,83 +301,15 @@ struct State final {
 		Ui::InputField::Mode::MultiLine,
 		tr::lng_photo_caption());
 	Ui::ResizeFitChild(wrap, input);
-
-	struct State final {
-		base::unique_qptr<ChatHelpers::TabbedPanel> emojiPanel;
-		base::unique_qptr<Limit> charsLimitation;
-	};
-	const auto state = box->lifetime().make_state<State>();
-
-	{
-		const auto container = box->getDelegate()->outerContainer();
-		using Selector = ChatHelpers::TabbedSelector;
-		state->emojiPanel = base::make_unique_q<ChatHelpers::TabbedPanel>(
-			container,
-			controller,
-			object_ptr<Selector>(
-				nullptr,
-				controller->uiShow(),
-				Window::GifPauseReason::Layer,
-				Selector::Mode::EmojiOnly));
-		const auto emojiPanel = state->emojiPanel.get();
-		emojiPanel->setDesiredHeightValues(
-			1.,
-			st::emojiPanMinHeight / 2,
-			st::emojiPanMinHeight);
-		emojiPanel->hide();
-		emojiPanel->selector()->setCurrentPeer(controller->session().user());
-		emojiPanel->selector()->emojiChosen(
-		) | rpl::on_next([=](ChatHelpers::EmojiChosen data) {
-			Ui::InsertEmojiAtCursor(input->textCursor(), data.emoji);
-		}, input->lifetime());
-		emojiPanel->selector()->customEmojiChosen(
-		) | rpl::on_next([=](ChatHelpers::FileChosen data) {
-			const auto info = data.document->sticker();
-			if (info
-				&& info->setType == Data::StickersType::Emoji
-				&& !controller->session().premium()) {
-				ShowPremiumPreviewBox(
-					controller,
-					PremiumFeature::AnimatedEmoji);
-			} else {
-				Data::InsertCustomEmoji(input, data.document);
-			}
-		}, input->lifetime());
-	}
-
-	const auto emojiButton = Ui::AddEmojiToggleToField(
-		input,
+	SetupCaptionFieldInBox(
 		box,
 		controller,
-		state->emojiPanel.get(),
-		st::sendGifWithCaptionEmojiPosition);
-	emojiButton->show();
-
-	const auto session = &controller->session();
-	const auto checkCharsLimitation = [=](auto repeat) -> void {
-		const auto remove = Ui::ComputeFieldCharacterCount(input)
-			- Data::PremiumLimits(session).captionLengthCurrent();
-		if (remove > 0) {
-			if (!state->charsLimitation) {
-				state->charsLimitation = base::make_unique_q<Limit>(
-					input,
-					emojiButton,
-					style::al_top);
-				state->charsLimitation->show();
-				Data::AmPremiumValue(session) | rpl::on_next([=] {
-					repeat(repeat);
-				}, state->charsLimitation->lifetime());
-			}
-			state->charsLimitation->setLeft(remove);
-			state->charsLimitation->show();
-		} else {
-			state->charsLimitation = nullptr;
-		}
-	};
-
-	input->changes() | rpl::on_next([=] {
-		checkCharsLimitation(checkCharsLimitation);
-	}, input->lifetime());
+		input,
+		controller->session().user(),
+		[](not_null<DocumentData*>) {
+			return false;
+		},
+		PremiumFeature::AnimatedEmoji);
 
 	return input;
 }
@@ -305,7 +320,8 @@ void CaptionBox(
 		TextWithTags initialText,
 		not_null<PeerData*> peer,
 		const SendMenu::Details &details,
-		Fn<void(Api::SendOptions, TextWithTags)> done) {
+		Fn<void(Api::SendOptions, TextWithTags)> done,
+		Fn<void(TextWithTags)> cancelled = nullptr) {
 	const auto window = Core::App().findWindow(box);
 	const auto controller = window ? window->sessionController() : nullptr;
 	if (!controller) {
@@ -321,9 +337,25 @@ void CaptionBox(
 
 	input->setTextWithTags(std::move(initialText));
 	input->setSubmitSettings(Core::App().settings().sendSubmitWay());
-	InitMessageField(controller, input, [=](not_null<DocumentData*>) {
-		return true;
+	const auto chatStyle = InitMessageField(
+		controller,
+		input,
+		[=](not_null<DocumentData*>) { return true; });
+
+	const auto aiButton = Ui::SetupCaptionAiButton({
+		.parent = input->parentWidget(),
+		.field = input,
+		.session = &controller->session(),
+		.show = controller->uiShow(),
+		.chatStyle = chatStyle,
 	});
+	rpl::combine(
+		box->sizeValue(),
+		input->geometryValue()
+	) | rpl::on_next([=](QSize, QRect) {
+		Ui::UpdateCaptionAiButtonGeometry(aiButton, input);
+		aiButton->raise();
+	}, aiButton->lifetime());
 
 	const auto sendMenuDetails = [=] { return details; };
 	struct Autocomplete {
@@ -380,6 +412,7 @@ void CaptionBox(
 		}
 	}
 
+	const auto confirmed = box->lifetime().make_state<bool>(false);
 	const auto send = [=, show = controller->uiShow()](
 			Api::SendOptions options) {
 		const auto textWithTags = input->getTextWithTags();
@@ -390,8 +423,17 @@ void CaptionBox(
 				tr::lng_edit_limit_reached(tr::now, lt_count, remove));
 			return;
 		}
+		*confirmed = true;
 		done(std::move(options), textWithTags);
 	};
+	if (cancelled) {
+		box->boxClosing(
+		) | rpl::on_next([=] {
+			if (!*confirmed) {
+				cancelled(input->getTextWithTags());
+			}
+		}, box->lifetime());
+	}
 	const auto confirm = box->addButton(
 		std::move(confirmText),
 		[=] { send({}); });
@@ -421,7 +463,9 @@ void SendGifWithCaptionBox(
 		not_null<DocumentData*> document,
 		not_null<PeerData*> peer,
 		const SendMenu::Details &details,
-		Fn<void(Api::SendOptions, TextWithTags)> c) {
+		TextWithTags initialText,
+		Fn<void(Api::SendOptions, TextWithTags)> c,
+		Fn<void(TextWithTags)> cancelled) {
 	box->setTitle(tr::lng_send_gif_with_caption());
 	const auto state = AddGifWidget(
 		box->verticalLayout(),
@@ -433,7 +477,41 @@ void SendGifWithCaptionBox(
 		document->owner().stickers().notifyGifWithCaptionSent();
 		c(std::move(o), std::move(t));
 	};
-	CaptionBox(box, tr::lng_send_button(), {}, peer, details, std::move(d));
+	CaptionBox(
+		box,
+		tr::lng_send_button(),
+		std::move(initialText),
+		peer,
+		details,
+		std::move(d),
+		std::move(cancelled));
+}
+
+void SendGifWithCaption(
+		std::shared_ptr<ChatHelpers::Show> show,
+		not_null<Ui::InputField*> field,
+		not_null<DocumentData*> document,
+		not_null<PeerData*> peer,
+		const SendMenu::Details &details,
+		Fn<void(Api::SendOptions, TextWithTags)> send) {
+	show->show(Box(
+		SendGifWithCaptionBox,
+		document,
+		peer,
+		details,
+		field->getTextWithTags(),
+		crl::guard(field, [=](
+				Api::SendOptions options,
+				TextWithTags caption) {
+			field->setTextWithTags({});
+			show->hideLayer(anim::type::normal);
+			send(std::move(options), std::move(caption));
+		}),
+		crl::guard(field, [=](TextWithTags caption) {
+			if (!caption.text.isEmpty()) {
+				field->setTextWithTags(std::move(caption));
+			}
+		})));
 }
 
 void EditCaptionBox(

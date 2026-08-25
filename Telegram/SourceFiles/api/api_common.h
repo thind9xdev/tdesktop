@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_drafts.h"
 
 class History;
+class PhotoData;
 
 namespace Data {
 class Thread;
@@ -36,6 +37,7 @@ struct SendOptions {
 	bool invertCaption = false;
 	bool hideViaBot = false;
 	bool mediaSpoiler = false;
+	bool welcomeTemplate = false;
 	crl::time ttlSeconds = 0;
 	SuggestOptions suggest;
 
@@ -84,6 +86,18 @@ struct RemoteFileInfo {
 	std::optional<MTPInputFile> thumb;
 	std::optional<MTPInputPhoto> videoCover;
 	std::vector<MTPInputDocument> attachedStickers;
+	bool forceFile = false;
+
+};
+
+struct VideoCoverEdit {
+	PhotoData *photo = nullptr;
+	bool cleared = false;
+	Fn<void(Fn<void(PhotoData*)> done)> refresh;
+
+	[[nodiscard]] explicit operator bool() const {
+		return (photo != nullptr) || cleared;
+	}
 };
 
 } // namespace Api

@@ -17,6 +17,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/power_save_blocker.h"
 #include "media/audio/media_audio.h"
 #include "media/audio/media_audio_capture.h"
+#include "media/player/media_player_listen_tracker.h"
 #include "media/streaming/media_streaming_instance.h"
 #include "media/streaming/media_streaming_player.h"
 #include "media/view/media_view_playback_progress.h"
@@ -60,6 +61,18 @@ base::options::toggle OptionDisableAutoplayNext({
 	.description = "Disable auto-play of the next "
 		"Audio file / Voice Message / Video message.",
 });
+
+[[nodiscard]] float64 LookupPlaybackSpeed(const AudioMsgId &audioId) {
+	if (!audioId.changeablePlaybackSpeed()) {
+		return 1.;
+	}
+	const auto document = audioId.audio();
+	return (document
+		&& !document->isVoiceMessage()
+		&& !document->isVideoMessage())
+		? Core::App().settings().audioPlaybackSpeed()
+		: Core::App().settings().voicePlaybackSpeed();
+}
 
 } // namespace
 
@@ -123,10 +136,16 @@ void SaveLastPlaybackPosition(
 		: (state.length >= limit * state.frequency)
 		? (state.position / state.frequency) * crl::time(1000)
 		: TimeId(0);
-	auto &session = document->session();
+	const auto &session = document->session();
 	if (session.local().mediaLastPlaybackPosition(document->id) != time) {
 		session.local().setMediaLastPlaybackPosition(document->id, time);
 	}
+}
+
+bool IsRealPlaybackContext(not_null<const HistoryItem*> item) {
+	return item->isRegular()
+		|| item->isScheduled()
+		|| item->isSavedMusicItem();
 }
 
 Instance::Streamed::Streamed(
@@ -187,9 +206,13 @@ Instance::Instance()
 	}, _lifetime);
 
 	setupShortcuts();
+
+	_listenTracker = std::make_unique<MusicListenTracker>();
 }
 
-Instance::~Instance() = default;
+Instance::~Instance() {
+	_listenTracker->finalize();
+}
 
 AudioMsgId::Type Instance::getActiveType() const {
 	if (const auto data = getData(AudioMsgId::Type::Voice)) {
@@ -229,8 +252,13 @@ void Instance::setCurrent(const AudioMsgId &audioId) {
 		const auto item = (audioId.audio() && audioId.contextId())
 			? audioId.audio()->owner().message(audioId.contextId())
 			: nullptr;
+		const auto samePending = (_pendingContextFor.audio() == audioId.audio())
+			&& (_pendingContextFor.contextId() == audioId.contextId());
+		const auto context = samePending
+			? _pendingContext
+			: std::optional<PlaylistContext>();
 		if (item) {
-			setHistory(data, item->history());
+			setHistory(data, item->history(), nullptr, item, context);
 		} else {
 			setHistory(
 				data,
@@ -245,15 +273,33 @@ void Instance::setCurrent(const AudioMsgId &audioId) {
 void Instance::setHistory(
 		not_null<Data*> data,
 		History *history,
-		Main::Session *sessionFallback) {
+		Main::Session *sessionFallback,
+		HistoryItem *item,
+		std::optional<PlaylistContext> context) {
 	if (history) {
 		data->history = history->migrateToOrMe();
-		data->topicRootId = 0;
-		data->monoforumPeerId = 0;
-		data->migrated = data->history->migrateFrom();
+		const auto peer = data->history->peer;
+		const auto sameHistory = item && (item->history() == data->history);
+		data->topicRootId = context
+			? context->topicRootId
+			: (sameHistory && peer->isForum())
+			? item->topicRootId()
+			: MsgId();
+		data->monoforumPeerId = context
+			? context->monoforumPeerId
+			: (!data->topicRootId
+				&& sameHistory
+				&& peer->amMonoforumAdmin())
+			? item->sublistPeerId()
+			: PeerId();
+		data->migrated = (data->topicRootId || data->monoforumPeerId)
+			? nullptr
+			: data->history->migrateFrom();
 		setSession(data, &history->session());
 	} else {
 		data->history = data->migrated = nullptr;
+		data->topicRootId = MsgId();
+		data->monoforumPeerId = PeerId();
 		setSession(data, sessionFallback);
 	}
 }
@@ -285,7 +331,10 @@ void Instance::setSession(not_null<Data*> data, Main::Session *session) {
 
 		session->data().itemRemoved(
 		) | rpl::filter([=](not_null<const HistoryItem*> item) {
-			return (data->current.contextId() == item->fullId());
+			const auto document = data->current.audio();
+			return (data->current.contextId() == item->fullId())
+				&& (IsRealPlaybackContext(item)
+					|| (document && document->isVideoMessage()));
 		}) | rpl::on_next([=] {
 			stopAndClear(data);
 		}, data->sessionLifetime);
@@ -416,10 +465,7 @@ auto Instance::playlistKey(not_null<const Data*> data) const
 		return {};
 	}
 	const auto item = data->history->owner().message(contextId);
-	if (!item
-		|| (!item->isRegular()
-			&& !item->isScheduled()
-			&& !item->isSavedMusicItem())) {
+	if (!item || !IsRealPlaybackContext(item)) {
 		return {};
 	}
 
@@ -533,7 +579,12 @@ bool Instance::moveInPlaylist(
 				if (document->isAudioFile()
 					|| document->isVoiceMessage()
 					|| document->isVideoMessage()) {
-					play(AudioMsgId(document, item->fullId()));
+					play(
+						AudioMsgId(document, item->fullId()),
+						PlaylistContext{
+							data->topicRootId,
+							data->monoforumPeerId,
+						});
 				}
 				return true;
 			}
@@ -793,11 +844,15 @@ void Instance::play(AudioMsgId::Type type) {
 	}
 }
 
-void Instance::play(const AudioMsgId &audioId) {
+void Instance::play(
+		const AudioMsgId &audioId,
+		std::optional<PlaylistContext> context) {
 	const auto document = audioId.audio();
 	if (!document) {
 		return;
 	}
+	_pendingContext = context;
+	_pendingContextFor = audioId;
 	if (document->isAudioFile()
 		|| document->isVoiceMessage()
 		|| document->isVideoMessage()) {
@@ -815,13 +870,15 @@ void Instance::play(const AudioMsgId &audioId) {
 	_playerStartedPlay.fire_copy({audioId.type()});
 }
 
-void Instance::playPause(const AudioMsgId &audioId) {
+void Instance::playPause(
+		const AudioMsgId &audioId,
+		std::optional<PlaylistContext> context) {
 	const auto now = current(audioId.type());
 	if (now.audio() == audioId.audio()
 		&& now.contextId() == audioId.contextId()) {
 		playPause(audioId.type());
 	} else {
-		play(audioId);
+		play(audioId, context);
 	}
 }
 
@@ -859,9 +916,7 @@ Streaming::PlaybackOptions Instance::streamingOptions(
 	result.mode = (document && document->isVideoMessage())
 		? Streaming::Mode::Both
 		: Streaming::Mode::Audio;
-	result.speed = audioId.changeablePlaybackSpeed()
-		? Core::App().settings().voicePlaybackSpeed()
-		: 1.;
+	result.speed = LookupPlaybackSpeed(audioId);
 	result.audioId = audioId;
 	if (position >= 0) {
 		result.position = position;
@@ -890,6 +945,9 @@ void Instance::stop(AudioMsgId::Type type, bool asFinished) {
 	if (const auto data = getData(type)) {
 		if (data->streamed) {
 			clearStreamed(data);
+		}
+		if (type == AudioMsgId::Type::Song) {
+			_listenTracker->finalize();
 		}
 		data->resumeOnCallEnd = false;
 		_playerStopped.fire_copy({type});
@@ -925,6 +983,8 @@ void Instance::validateShuffleData(not_null<Data*> data) {
 		|| raw->scheduled != scheduled
 		|| raw->savedMusic != savedMusic) {
 		raw->history = data->history;
+		raw->topicRootId = data->topicRootId;
+		raw->monoforumPeerId = data->monoforumPeerId;
 		raw->migrated = data->migrated;
 		raw->scheduled = scheduled;
 		raw->savedMusic = savedMusic;
@@ -974,7 +1034,10 @@ void Instance::validateShuffleData(not_null<Data*> data) {
 	const auto last = raw->playlist.empty()
 		? MsgId(ServerMaxMsgId - 1)
 		: raw->playlist.back();
-	SharedMediaMergedViewer(
+	const auto sharedMediaViewer = raw->savedMusic
+		? SavedMusicMediaViewer
+		: SharedMediaMergedViewer;
+	sharedMediaViewer(
 		&raw->history->session(),
 		SharedMediaMergedKey(
 			SliceKey(
@@ -1159,14 +1222,13 @@ void Instance::cancelSeeking(AudioMsgId::Type type) {
 	_seekingChanges.fire({ .seeking = Seeking::Cancel, .type = type });
 }
 
-void Instance::updateVoicePlaybackSpeed() {
+void Instance::updatePlaybackSpeed() {
 	if (const auto data = getData(getActiveType())) {
 		if (!data->current.changeablePlaybackSpeed()) {
 			return;
 		}
 		if (const auto streamed = data->streamed.get()) {
-			streamed->instance.setSpeed(
-				Core::App().settings().voicePlaybackSpeed());
+			streamed->instance.setSpeed(LookupPlaybackSpeed(data->current));
 		}
 	}
 }
@@ -1262,6 +1324,18 @@ void Instance::emitUpdate(AudioMsgId::Type type, CheckCallback check) {
 			}
 		}
 		updatePowerSaveBlocker(data, state);
+		const auto activelyPlayingRound = (type == AudioMsgId::Type::Voice)
+			&& !IsPausedOrPausing(state.state)
+			&& !IsStoppedOrStopping(state.state)
+			&& data->current.audio()
+			&& data->current.audio()->isVideoMessage();
+		if (_roundPlaying != activelyPlayingRound) {
+			_roundPlaying = activelyPlayingRound;
+			Core::App().floatPlayerToggleGifsPaused(activelyPlayingRound);
+		}
+		if (type == AudioMsgId::Type::Song) {
+			_listenTracker->update(state);
+		}
 
 		auto finished = false;
 		_updatedNotifier.fire_copy({state});
@@ -1313,6 +1387,7 @@ void Instance::setupShortcuts() {
 }
 
 void Instance::stopAndClose() {
+	_listenTracker->finalize();
 	_closePlayerRequests.fire({});
 
 	stop(AudioMsgId::Type::Voice);
@@ -1333,8 +1408,6 @@ void Instance::handleStreamingUpdate(
 					float64) {
 				requestRoundVideoRepaint();
 			});
-			_roundPlaying = true;
-			Core::App().floatPlayerToggleGifsPaused(true);
 			requestRoundVideoResize();
 		}
 		emitUpdate(data->type);

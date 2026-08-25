@@ -42,6 +42,9 @@ public:
 	void setBackgroundMargins(const QMargins &margins = QMargins());
 	void setCustomRadius(int radius);
 	void setCustomDuration(crl::time duration);
+	void setHideEmoji(bool hide);
+	void setContentShift(QPoint shift);
+	[[nodiscard]] QSize contentSize() const;
 
 	~MediaPreviewWidget();
 
@@ -95,6 +98,8 @@ private:
 	QMargins _backgroundMargins;
 	int _customRadius = 0;
 	crl::time _customDuration = 0;
+	bool _hideEmoji = false;
+	QPoint _contentShift;
 
 };
 

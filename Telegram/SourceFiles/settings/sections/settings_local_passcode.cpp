@@ -159,47 +159,23 @@ void LocalPasscodeEnter::setupContent() {
 
 	Ui::AddSkip(content, st::settingLocalPasscodeDescriptionBottomSkip);
 
-	const auto addField = [&](rpl::producer<QString> &&text) {
-		const auto &st = st::settingLocalPasscodeInputField;
-		auto container = object_ptr<Ui::RpWidget>(content);
-		container->resize(container->width(), st.heightMin);
-		const auto field = Ui::CreateChild<Ui::PasswordInput>(
-			container.data(),
-			st,
-			std::move(text));
-
-		container->geometryValue(
-		) | rpl::on_next([=](const QRect &r) {
-			field->moveToLeft((r.width() - field->width()) / 2, 0);
-		}, container->lifetime());
-
-		content->add(std::move(container));
-		return field;
-	};
-
-	const auto addError = [&](not_null<Ui::PasswordInput*> input) {
-		const auto error = content->add(
-			object_ptr<Ui::FlatLabel>(
-				content,
-				tr::lng_language_name(tr::now),
-				st::settingLocalPasscodeError),
-			st::changePhoneDescriptionPadding,
-			style::al_top);
-		error->hide();
-		QObject::connect(input.get(), &Ui::MaskedInputField::changed, [=] {
-			error->hide();
-		});
-		return error;
-	};
-
-	const auto newPasscode = addField(isCreate
-		? tr::lng_passcode_enter_first()
-		: tr::lng_passcode_enter());
+	const auto newPasscode = CloudPassword::AddPasswordField(
+		content,
+		isCreate
+			? tr::lng_passcode_enter_first()
+			: tr::lng_passcode_enter(),
+		QString());
 
 	const auto reenterPasscode = isCheck
 		? (Ui::PasswordInput*)(nullptr)
-		: addField(tr::lng_passcode_confirm_new());
-	const auto error = addError(isCheck ? newPasscode : reenterPasscode);
+		: CloudPassword::AddPasswordField(
+			content,
+			tr::lng_passcode_confirm_new(),
+			QString()).get();
+	const auto error = CloudPassword::AddError(
+		content,
+		isCheck ? newPasscode.get() : reenterPasscode);
+	error->setText(tr::lng_language_name(tr::now));
 
 	const auto button = content->add(
 		object_ptr<Ui::RoundButton>(
@@ -212,7 +188,6 @@ void LocalPasscodeEnter::setupContent() {
 			st::changePhoneButton),
 		st::settingLocalPasscodeButtonPadding,
 		style::al_top);
-	button->setTextTransform(Ui::RoundButton::TextTransform::NoTransform);
 	button->setClickedCallback([=] {
 		const auto newText = newPasscode->text();
 		const auto reenterText = reenterPasscode
@@ -501,6 +476,8 @@ void BuildManageContent(SectionBuilder &builder) {
 				: UnlockType::None;
 		}));
 
+		const auto highlights = ctx.highlights;
+
 		unlockType->value(
 		) | rpl::on_next([=](UnlockType type) {
 			while (systemUnlockContent->count()) {
@@ -535,6 +512,13 @@ void BuildManageContent(SectionBuilder &builder) {
 				Core::App().settings().setSystemUnlockEnabled(value);
 				Core::App().saveSettingsDelayed();
 			}, systemUnlockContent->lifetime());
+
+			if (highlights) {
+				highlights->push_back({
+					u"passcode/biometrics"_q,
+					{ biometricsButton.get() },
+				});
+			}
 
 			Ui::AddSkip(systemUnlockContent);
 
@@ -596,6 +580,7 @@ private:
 
 	rpl::variable<bool> _isBottomFillerShown;
 	rpl::event_stream<> _showBack;
+	QPointer<Ui::RpWidget> _disableButton;
 
 };
 
@@ -632,6 +617,9 @@ void LocalPasscodeManage::setupContent() {
 			not_null<Window::SessionController*> controller,
 			Fn<void(Type)> showOther,
 			rpl::producer<> showFinished) {
+		auto &lifetime = container->lifetime();
+		const auto highlights = lifetime.make_state<HighlightRegistry>();
+
 		const auto isPaused = Window::PausedIn(
 			controller,
 			Window::GifPauseReason::Layer);
@@ -640,8 +628,20 @@ void LocalPasscodeManage::setupContent() {
 			.controller = controller,
 			.showOther = std::move(showOther),
 			.isPaused = isPaused,
+			.highlights = highlights,
 		});
 		BuildManageContent(builder);
+
+		std::move(showFinished) | rpl::on_next([=] {
+			for (const auto &[id, entry] : *highlights) {
+				if (entry.widget) {
+					controller->checkHighlightControl(
+						id,
+						entry.widget,
+						base::duplicate(entry.args));
+				}
+			}
+		}, lifetime);
 	};
 
 	build(content, buildMethod);
@@ -680,12 +680,16 @@ base::weak_qptr<Ui::RpWidget> LocalPasscodeManage::createPinnedToBottom(
 		std::move(callback));
 
 	_isBottomFillerShown = base::take(bottomButton.isBottomFillerShown);
+	_disableButton = bottomButton.button.get();
 
 	return bottomButton.content;
 }
 
 void LocalPasscodeManage::showFinished() {
 	Section<LocalPasscodeManage>::showFinished();
+	controller()->checkHighlightControl(
+		u"passcode/disable"_q,
+		_disableButton);
 }
 
 rpl::producer<> LocalPasscodeManage::sectionShowBack() {

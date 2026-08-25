@@ -14,6 +14,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "platform/platform_window_title.h"
 #include "history/history.h"
 #include "info/media/info_media_widget.h" // SharedMediaTitle.
+#include "window/window_saved_windows.h"
 #include "window/window_separate_id.h"
 #include "window/window_session_controller.h"
 #include "window/window_lock_widgets.h"
@@ -31,16 +32,23 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session_settings.h"
 #include "base/options.h"
 #include "base/crc32hash.h"
+#include "ui/boxes/confirm_box.h"
 #include "ui/toast/toast.h"
 #include "ui/widgets/shadow.h"
 #include "ui/controls/window_outdated_bar.h"
+#include "ui/controls/window_screen_reader_bar.h"
 #include "ui/painter.h"
+#include "ui/screen_reader_mode.h"
 #include "ui/ui_utility.h"
 #include "apiwrap.h"
 #include "mainwidget.h" // session->content()->windowShown().
 #include "tray.h"
 #include "styles/style_window.h"
 #include "styles/style_dialogs.h" // ChildSkip().x() for new child windows.
+
+#ifdef Q_OS_MAC
+#include "platform/mac/global_menu_mac.h"
+#endif // Q_OS_MAC
 
 #include <QtCore/QMimeData>
 #include <QtGui/QWindow>
@@ -78,6 +86,9 @@ base::options::toggle OptionNewWindowsSizeAsFirst({
 base::options::toggle OptionDisableTouchbar({
 	.id = kOptionDisableTouchbar,
 	.name = "Disable Touch Bar (macOS only).",
+#ifdef Q_OS_MAC
+	.defaultValue = !Platform::HasTouchBar(),
+#endif // Q_OS_MAC
 	.scope = [] {
 #ifdef Q_OS_MAC
 		return true;
@@ -176,7 +187,7 @@ void OverrideApplicationIcon(QImage image) {
 	OverridenIcon() = std::move(image);
 }
 
-QIcon CreateOfficialIcon(Main::Session *session) {
+QIcon CreateSupportIcon(Main::Session *session) {
 	const auto support = (session && session->supportMode());
 	if (!support) {
 		return QIcon();
@@ -190,22 +201,27 @@ QIcon CreateOfficialIcon(Main::Session *session) {
 }
 
 QIcon CreateIcon(Main::Session *session, bool returnNullIfDefault) {
-	const auto officialIcon = CreateOfficialIcon(session);
-	if (!officialIcon.isNull() || returnNullIfDefault) {
-		return officialIcon;
+	const auto supportIcon = CreateSupportIcon(session);
+	if (!supportIcon.isNull() || returnNullIfDefault) {
+		return supportIcon;
 	}
 
-	auto result = QIcon(Ui::PixmapFromImage(base::duplicate(Logo())));
+	const auto officialIcon = QIcon(
+		Ui::PixmapFromImage(base::duplicate(Logo())));
 
 	if constexpr (!Platform::IsLinux()) {
-		return result;
+		return officialIcon;
 	}
 
 	const auto iconFromTheme = QIcon::fromTheme(
 		Platform::ApplicationIconName(),
-		result);
+		officialIcon);
 
-	result = QIcon();
+	if (!Platform::IsX11()) {
+		return iconFromTheme;
+	}
+
+	QIcon result;
 
 	static const auto iconSizes = {
 		16,
@@ -368,6 +384,20 @@ MainWindow::MainWindow(not_null<Controller*> controller)
 : _controller(controller)
 , _positionUpdatedTimer([=] { savePosition(); })
 , _outdated(Ui::CreateOutdatedBar(body(), cWorkingDir()))
+, _screenReaderBar(Ui::CreateScreenReaderBar(body(), [=] {
+	controller->show(Ui::MakeConfirmBox({
+		.text = tr::lng_screen_reader_confirm_text(tr::now),
+		.confirmed = [=](Fn<void()> close) {
+			Core::App().settings().writePref<bool>(
+				Core::kScreenReaderModeDisabledKey,
+				true);
+			Core::App().saveSettingsDelayed();
+			Ui::SetScreenReaderModeDisabled(true);
+			close();
+		},
+		.confirmText = tr::lng_screen_reader_confirm_disable(),
+	}));
+}))
 , _body(body()) {
 	style::PaletteChanged(
 	) | rpl::on_next([=] {
@@ -417,6 +447,13 @@ MainWindow::MainWindow(not_null<Controller*> controller)
 			}
 			updateControlsGeometry();
 		}, _outdated->lifetime());
+	}
+
+	if (_screenReaderBar) {
+		_screenReaderBar->heightValue(
+		) | rpl::on_next([=](int height) {
+			updateControlsGeometry();
+		}, _screenReaderBar->lifetime());
 	}
 
 	Shortcuts::Listen(this);
@@ -474,6 +511,14 @@ bool MainWindow::hideNoQuit() {
 void MainWindow::clearWidgets() {
 	clearWidgetsHook();
 	updateGlobalMenu();
+}
+
+void MainWindow::updateGlobalMenu() {
+#ifdef Q_OS_MAC
+	Platform::RequestUpdateGlobalMenu();
+#else // Q_OS_MAC
+	updateGlobalMenuHook();
+#endif // Q_OS_MAC
 }
 
 void MainWindow::updateIsActive() {
@@ -606,7 +651,14 @@ int MainWindow::computeMinHeight() const {
 		_outdated->resizeToWidth(st::windowMinWidth);
 		return _outdated->height();
 	}();
-	return outdated + st::windowMinHeight;
+	const auto screenReader = [&] {
+		if (!_screenReaderBar) {
+			return 0;
+		}
+		_screenReaderBar->resizeToWidth(st::windowMinWidth);
+		return _screenReaderBar->height();
+	}();
+	return outdated + screenReader + st::windowMinHeight;
 }
 
 void MainWindow::refreshTitleWidget() {
@@ -634,6 +686,11 @@ void MainWindow::recountGeometryConstraints() {
 }
 
 WindowPosition MainWindow::initialPosition() const {
+	if (const auto saved = Core::App().savedWindows()) {
+		if (const auto restored = saved->restorePositionFor(id())) {
+			return Core::AdjustToScale(*restored, u"Window"_q);
+		}
+	}
 	const auto active = Core::App().activeWindow();
 	return (!active || active == &controller())
 		? Core::AdjustToScale(
@@ -762,6 +819,12 @@ void MainWindow::updateControlsGeometry() {
 		_outdated->moveToLeft(inner.x(), bodyTop);
 		bodyTop += _outdated->height();
 	}
+	if (_screenReaderBar) {
+		Ui::SendPendingMoveResizeEvents(_screenReaderBar.data());
+		_screenReaderBar->resizeToWidth(inner.width());
+		_screenReaderBar->moveToLeft(inner.x(), bodyTop);
+		bodyTop += _screenReaderBar->height();
+	}
 	if (_rightColumn) {
 		bodyWidth -= _rightColumn->width();
 		_rightColumn->setGeometry(bodyWidth, bodyTop, inner.width() - bodyWidth, inner.height() - (bodyTop - inner.y()));
@@ -832,8 +895,13 @@ void MainWindow::savePosition(Qt::WindowState state) {
 
 	if (state == Qt::WindowMinimized
 		|| !isVisible()
-		|| !Core::App().savingPositionFor(&controller())
 		|| !positionInited()) {
+		return;
+	}
+	if (const auto saved = Core::App().savedWindows()) {
+		saved->scheduleSave();
+	}
+	if (!Core::App().savingPositionFor(&controller())) {
 		return;
 	}
 
@@ -884,6 +952,53 @@ WindowPosition MainWindow::withScreenInPosition(
 		this,
 		{ st::windowMinWidth, st::windowMinHeight },
 		u"Window"_q);
+}
+
+WindowPosition MainWindow::countPositionForSave() {
+	auto result = WindowPosition{ .scale = cScale() };
+	const auto handle = windowHandle();
+	const auto state = handle ? handle->windowState() : Qt::WindowNoState;
+	const auto windowScreen = screen();
+	const auto screenGeometry = windowScreen
+		? windowScreen->geometry()
+		: QRect();
+	if (windowScreen) {
+		result.moncrc = Platform::ScreenNameChecksum(windowScreen->name());
+	}
+	if (state == Qt::WindowMaximized || state == Qt::WindowFullScreen) {
+		result.maximized = 1;
+		const auto normal = normalGeometry();
+		result.x = normal.x() - screenGeometry.x();
+		result.y = normal.y() - screenGeometry.y();
+		result.w = normal.width();
+		result.h = normal.height();
+		return result;
+	}
+	const auto rect = body()->mapToGlobal(body()->rect());
+	result.x = rect.x();
+	result.y = rect.y();
+	result.w = rect.width() - (_rightColumn ? _rightColumn->width() : 0);
+	result.h = rect.height();
+	result = withScreenInPosition(result);
+	result.x -= screenGeometry.x();
+	result.y -= screenGeometry.y();
+	return result;
+}
+
+void MainWindow::applySavedPosition(const Core::WindowPosition &position) {
+	const auto geometry = countInitialGeometry(
+		Core::AdjustToScale(position, u"Window"_q));
+	const auto handle = windowHandle();
+	const auto state = handle ? handle->windowState() : Qt::WindowNoState;
+	if (position.maximized) {
+		setGeometry(geometry);
+		setWindowState(Qt::WindowMaximized);
+	} else {
+		if (state == Qt::WindowMaximized || state == Qt::WindowFullScreen) {
+			setWindowState(Qt::WindowNoState);
+		}
+		setGeometry(geometry);
+	}
 }
 
 bool MainWindow::minimizeToTray() {
@@ -958,12 +1073,16 @@ int MainWindow::tryToExtendWidthBy(int addToWidth) {
 
 void MainWindow::launchDrag(
 		std::unique_ptr<QMimeData> data,
-		Fn<void()> &&callback) {
+		Fn<void()> &&callback,
+		QPixmap pixmap) {
 	// Qt destroys this QDrag automatically after the drag is finished
 	// We must not delete this at the end of this function, as this breaks DnD on Linux
 	auto drag = new QDrag(this);
 	KUrlMimeData::exportUrlsToPortal(data.get());
 	drag->setMimeData(data.release());
+	if (!pixmap.isNull()) {
+		drag->setPixmap(std::move(pixmap));
+	}
 	drag->exec(Qt::CopyAction);
 
 	// We don't receive mouseReleaseEvent when drag is finished.

@@ -173,6 +173,7 @@ struct GiftCode {
 	PeerData *stargiftReleasedBy = nullptr;
 	std::shared_ptr<UniqueGift> unique;
 	TextWithEntities message;
+	PeerData *messageAuthor = nullptr;
 	PeerData *auctionTo = nullptr;
 	ChannelData *channel = nullptr;
 	PeerData *channelFrom = nullptr;
@@ -197,13 +198,17 @@ struct GiftCode {
 	bool upgradeGifted : 1 = false;
 	bool upgradable : 1 = false;
 	bool unclaimed : 1 = false;
+	bool messageFromUniqueAction : 1 = false;
 	bool anonymous : 1 = false;
 	bool converted : 1 = false;
 	bool upgraded : 1 = false;
 	bool refunded : 1 = false;
 	bool upgrade : 1 = false;
 	bool saved : 1 = false;
+	bool craft : 1 = false;
 };
+
+inline constexpr auto kTimeToLiveSingleView = crl::time(0x7FFFFFFF);
 
 class Media {
 public:
@@ -265,6 +270,7 @@ public:
 	virtual bool forceForwardedInfo() const;
 	[[nodiscard]] virtual bool hasSpoiler() const;
 	[[nodiscard]] virtual crl::time ttlSeconds() const;
+	[[nodiscard]] bool ttlSecondsSingleView() const;
 
 	[[nodiscard]] virtual bool consumeMessageText(
 		const TextWithEntities &text);
@@ -299,10 +305,15 @@ private:
 
 class MediaPhoto final : public Media {
 public:
+	struct Args {
+		crl::time ttlSeconds = 0;
+		bool spoiler = false;
+	};
+
 	MediaPhoto(
 		not_null<HistoryItem*> parent,
 		not_null<PhotoData*> photo,
-		bool spoiler);
+		Args &&args);
 	MediaPhoto(
 		not_null<HistoryItem*> parent,
 		not_null<PeerData*> chat,
@@ -326,6 +337,8 @@ public:
 	bool allowsEditCaption() const override;
 	bool allowsEditMedia() const override;
 	bool hasSpoiler() const override;
+	crl::time ttlSeconds() const override;
+	bool allowsForward() const override;
 
 	bool updateInlineResultMedia(const MTPMessageMedia &media) override;
 	bool updateSentMedia(const MTPMessageMedia &media) override;
@@ -337,6 +350,7 @@ public:
 private:
 	not_null<PhotoData*> _photo;
 	PeerData *_chat = nullptr;
+	crl::time _ttlSeconds = 0;
 	bool _spoiler = false;
 
 };
@@ -394,7 +408,7 @@ private:
 	not_null<DocumentData*> _document;
 	PhotoData *_videoCover = nullptr;
 
-	// Video (unsupported) / Voice / Round.
+	// Video / Voice / Round.
 	crl::time _ttlSeconds = 0;
 
 	QString _emoji;
@@ -419,6 +433,7 @@ public:
 	std::unique_ptr<Media> clone(not_null<HistoryItem*> parent) override;
 
 	const SharedContact *sharedContact() const override;
+	ItemPreview toPreview(ToPreviewOptions options) const override;
 	TextWithEntities notificationText() const override;
 	QString pinnedTextSubstring() const override;
 	TextForMimeData clipboardText() const override;
@@ -493,6 +508,7 @@ public:
 	std::unique_ptr<Media> clone(not_null<HistoryItem*> parent) override;
 
 	const Call *call() const override;
+	ItemPreview toPreview(ToPreviewOptions options) const override;
 	TextWithEntities notificationText() const override;
 	QString pinnedTextSubstring() const override;
 	TextForMimeData clipboardText() const override;
@@ -632,10 +648,14 @@ public:
 	std::unique_ptr<Media> clone(not_null<HistoryItem*> parent) override;
 
 	PollData *poll() const override;
+	Storage::SharedMediaTypesMask sharedMediaTypes() const override;
 
+	ItemPreview toPreview(ToPreviewOptions options) const override;
 	TextWithEntities notificationText() const override;
 	QString pinnedTextSubstring() const override;
 	TextForMimeData clipboardText() const override;
+	bool consumeMessageText(const TextWithEntities &text) override;
+	TextWithEntities consumedMessageText() const override;
 
 	bool updateInlineResultMedia(const MTPMessageMedia &media) override;
 	bool updateSentMedia(const MTPMessageMedia &media) override;
@@ -646,6 +666,7 @@ public:
 
 private:
 	not_null<PollData*> _poll;
+	TextWithEntities _consumedText;
 
 };
 
@@ -660,6 +681,7 @@ public:
 
 	TodoListData *todolist() const override;
 
+	ItemPreview toPreview(ToPreviewOptions options) const override;
 	TextWithEntities notificationText() const override;
 	QString pinnedTextSubstring() const override;
 	TextForMimeData clipboardText() const override;
@@ -795,6 +817,7 @@ public:
 	bool storyUnsupported() const override;
 	bool storyMention() const override;
 
+	ItemPreview toPreview(ToPreviewOptions options) const override;
 	TextWithEntities notificationText() const override;
 	QString pinnedTextSubstring() const override;
 	TextForMimeData clipboardText() const override;
@@ -829,6 +852,7 @@ public:
 
 	const GiveawayStart *giveawayStart() const override;
 
+	ItemPreview toPreview(ToPreviewOptions options) const override;
 	TextWithEntities notificationText() const override;
 	QString pinnedTextSubstring() const override;
 	TextForMimeData clipboardText() const override;
@@ -855,6 +879,7 @@ public:
 
 	const GiveawayResults *giveawayResults() const override;
 
+	ItemPreview toPreview(ToPreviewOptions options) const override;
 	TextWithEntities notificationText() const override;
 	QString pinnedTextSubstring() const override;
 	TextForMimeData clipboardText() const override;

@@ -14,17 +14,18 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/call_delayed.h"
 #include "base/platform/base_platform_custom_app_icon.h"
 #include "base/platform/base_platform_info.h"
+#include "base/screen_reader_state.h"
 #include "boxes/about_box.h"
 #include "boxes/auto_download_box.h"
 #include "boxes/connection_box.h"
 #include "boxes/download_path_box.h"
-#include "boxes/local_storage_box.h"
 #include "core/application.h"
 #include "core/core_settings.h"
 #include "core/file_utilities.h"
 #include "core/launcher.h"
 #include "core/update_checker.h"
 #include "data/data_auto_download.h"
+#include "data/data_session.h"
 #include "export/export_manager.h"
 #include "info/downloads/info_downloads_widget.h"
 #include "info/info_memento.h"
@@ -32,10 +33,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_account.h"
 #include "main/main_domain.h"
 #include "main/main_session.h"
+#include "main/main_session_settings.h"
 #include "mtproto/facade.h"
 #include "mtproto/mtp_instance.h"
 #include "platform/platform_specific.h"
 #include "settings/settings_builder.h"
+#include "settings/sections/settings_local_storage.h"
 #include "settings/sections/settings_main.h"
 #include "settings/sections/settings_chat.h"
 #include "settings/settings_experimental.h"
@@ -52,6 +55,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/platform/ui_platform_window.h"
 #include "ui/power_saving.h"
 #include "ui/rp_widget.h"
+#include "ui/screen_reader_mode.h"
 #include "ui/text/format_values.h"
 #include "ui/ui_utility.h"
 #include "ui/vertical_list.h"
@@ -61,6 +65,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/slide_wrap.h"
 #include "ui/wrap/vertical_layout.h"
 #include "window/window_controller.h"
+#include "window/window_saved_windows.h"
 #include "window/window_session_controller.h"
 #include "styles/style_layers.h"
 #include "styles/style_menu_icons.h"
@@ -75,6 +80,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "chat_helpers/spellchecker_common.h"
 #include "spellcheck/platform/platform_spellcheck.h"
 #endif // !TDESKTOP_DISABLE_SPELLCHECK
+
+#include <ksandbox.h>
 
 namespace Settings {
 namespace {
@@ -165,7 +172,7 @@ void BuildDataStorageSection(SectionBuilder &builder) {
 		.title = tr::lng_settings_manage_local_storage(),
 		.icon = { &st::menuIconStorage },
 		.onClick = [=] {
-			LocalStorageBox::Show(controller);
+			controller->showSettings(LocalStorageId());
 		},
 		.keywords = { u"storage"_q, u"cache"_q, u"local"_q },
 	});
@@ -209,6 +216,7 @@ void BuildDataStorageSection(SectionBuilder &builder) {
 
 void BuildAutoDownloadSection(SectionBuilder &builder) {
 	const auto controller = builder.controller();
+	const auto container = builder.container();
 	const auto session = builder.session();
 	builder.addDivider();
 	builder.addSkip();
@@ -220,35 +228,78 @@ void BuildAutoDownloadSection(SectionBuilder &builder) {
 
 	using Source = Data::AutoDownload::Source;
 
-	builder.addButton({
-		.id = u"advanced/auto_download_private"_q,
-		.title = tr::lng_media_auto_in_private(),
-		.icon = { &st::menuIconProfile },
-		.onClick = [=] {
-			controller->show(Box<AutoDownloadBox>(session, Source::User));
-		},
-		.keywords = { u"auto"_q, u"download"_q, u"private"_q, u"media"_q },
-	});
+	struct State {
+		rpl::event_stream<> changes;
+	};
+	const auto state = container
+		? container->lifetime().make_state<State>()
+		: nullptr;
+	const auto shouldBeChecked = [=](Source source) {
+		return HasEnabledTypes(session->settings().autoDownload(), source);
+	};
+	const auto add = [&](
+			QString id,
+			rpl::producer<QString> title,
+			const style::icon *icon,
+			Source source,
+			QStringList keywords) {
+		const auto row = builder.addButton({
+			.id = std::move(id),
+			.title = std::move(title),
+			.icon = { icon },
+			.onClick = [=] {
+				auto box = Box<AutoDownloadBox>(session, source);
+				box->boxClosing() | rpl::on_next(crl::guard(container, [=] {
+					state->changes.fire({});
+				}), box->lifetime());
+				controller->show(std::move(box));
+			},
+			.keywords = std::move(keywords),
+		});
+		if (!row) {
+			return;
+		}
+		const auto [toggle, checkView] = AddSeparatedToggle(
+			row,
+			st::settingsButton,
+			shouldBeChecked(source));
+		state->changes.events() | rpl::on_next([=] {
+			checkView->setChecked(shouldBeChecked(source), anim::type::normal);
+		}, row->lifetime());
+		toggle->clicks() | rpl::on_next([=] {
+			auto &data = session->settings().autoDownload();
+			const auto enable = !checkView->checked();
+			if (enable) {
+				SetDefaultsForSource(data, source);
+				session->data().photoLoadSettingsChanged();
+				session->data().documentLoadSettingsChanged();
+			} else {
+				SetDisabledForSource(data, source);
+				session->data().checkPlayingAnimations();
+			}
+			session->saveSettingsDelayed();
+			state->changes.fire({});
+		}, toggle->lifetime());
+	};
 
-	builder.addButton({
-		.id = u"advanced/auto_download_groups"_q,
-		.title = tr::lng_media_auto_in_groups(),
-		.icon = { &st::menuIconGroups },
-		.onClick = [=] {
-			controller->show(Box<AutoDownloadBox>(session, Source::Group));
-		},
-		.keywords = { u"auto"_q, u"download"_q, u"groups"_q, u"media"_q },
-	});
-
-	builder.addButton({
-		.id = u"advanced/auto_download_channels"_q,
-		.title = tr::lng_media_auto_in_channels(),
-		.icon = { &st::menuIconChannel },
-		.onClick = [=] {
-			controller->show(Box<AutoDownloadBox>(session, Source::Channel));
-		},
-		.keywords = { u"auto"_q, u"download"_q, u"channels"_q, u"media"_q },
-	});
+	add(
+		u"advanced/auto_download_private"_q,
+		tr::lng_media_auto_in_private(),
+		&st::menuIconProfile,
+		Source::User,
+		{ u"auto"_q, u"download"_q, u"private"_q, u"media"_q });
+	add(
+		u"advanced/auto_download_groups"_q,
+		tr::lng_media_auto_in_groups(),
+		&st::menuIconGroups,
+		Source::Group,
+		{ u"auto"_q, u"download"_q, u"groups"_q, u"media"_q });
+	add(
+		u"advanced/auto_download_channels"_q,
+		tr::lng_media_auto_in_channels(),
+		&st::menuIconChannel,
+		Source::Channel,
+		{ u"auto"_q, u"download"_q, u"channels"_q, u"media"_q });
 
 	builder.addSkip(st::settingsCheckboxesSkip);
 }
@@ -346,6 +397,70 @@ void BuildWindowTitleSection(SectionBuilder &builder) {
 
 	builder.addSkip();
 }
+
+#if !defined Q_OS_WIN && !defined Q_OS_MAC
+void BuildWindowCloseBehaviorSection(SectionBuilder &builder) {
+	using Behavior = Core::Settings::CloseBehavior;
+
+	const auto settings = &Core::App().settings();
+	auto shown = Platform::TrayIconSupported()
+		? (Core::App().settings().workModeValue(
+			) | rpl::map([](Core::Settings::WorkMode mode) {
+				return (mode == Core::Settings::WorkMode::WindowOnly);
+			}) | rpl::distinct_until_changed() | rpl::type_erased)
+		: rpl::producer<bool>(nullptr);
+
+	builder.scope([&] {
+		builder.addDivider();
+		builder.addSkip();
+		builder.addSubsectionTitle({
+			.id = u"advanced/window_close"_q,
+			.title = tr::lng_settings_window_close(),
+			.keywords = { u"close"_q, u"window"_q, u"background"_q, u"quit"_q, u"taskbar"_q, u"minimize"_q },
+		});
+
+		builder.add([settings](const WidgetContext &ctx) {
+			const auto container = ctx.container.get();
+			auto wrap = object_ptr<Ui::VerticalLayout>(container);
+			const auto inner = wrap.data();
+
+			const auto group = std::make_shared<Ui::RadioenumGroup<Behavior>>(
+				settings->closeBehavior());
+			const auto addRadio = [&](Behavior value, const QString &label) {
+				inner->add(
+					object_ptr<Ui::Radioenum<Behavior>>(
+						inner,
+						group,
+						value,
+						label,
+						st::settingsSendType),
+					st::settingsSendTypePadding);
+			};
+
+			addRadio(
+				Behavior::RunInBackground,
+				tr::lng_settings_run_in_background(tr::now));
+			addRadio(
+				Behavior::CloseToTaskbar,
+				tr::lng_settings_close_to_taskbar(tr::now));
+			addRadio(
+				Behavior::Quit,
+				tr::lng_settings_quit_on_close(tr::now));
+
+			group->value() | rpl::filter([=](Behavior value) {
+				return (value != settings->closeBehavior());
+			}) | rpl::on_next([=](Behavior value) {
+				settings->setCloseBehavior(value);
+				Local::writeSettings();
+			}, inner->lifetime());
+
+			return SectionBuilder::WidgetToAdd{ .widget = std::move(wrap) };
+		});
+
+		builder.addSkip();
+	}, std::move(shown));
+}
+#endif // !Q_OS_WIN && !Q_OS_MAC
 
 void BuildSystemIntegrationSection(SectionBuilder &builder) {
 	const auto controller = builder.controller();
@@ -469,6 +584,22 @@ void BuildSystemIntegrationSection(SectionBuilder &builder) {
 			settings->setMacWarnBeforeQuit(checked);
 			Core::App().saveSettingsDelayed();
 		}, warnBeforeQuit->lifetime());
+	}
+
+	const auto systemReplace = builder.addCheckbox({
+		.id = u"advanced/system_text_replace"_q,
+		.title = tr::lng_settings_system_text_replace(),
+		.checked = settings->systemTextReplace(),
+		.keywords = { u"text"_q, u"replace"_q, u"system"_q },
+	});
+	if (systemReplace) {
+		systemReplace->checkedChanges(
+		) | rpl::filter([=](bool checked) {
+			return (checked != settings->systemTextReplace());
+		}) | rpl::on_next([=](bool checked) {
+			settings->setSystemTextReplace(checked);
+			Core::App().saveSettingsDelayed();
+		}, systemReplace->lifetime());
 	}
 
 #ifndef OS_MAC_STORE
@@ -615,6 +746,28 @@ void BuildSystemIntegrationSection(SectionBuilder &builder) {
 		}
 	}
 
+	const auto restoreWindows = builder.addCheckbox({
+		.id = u"advanced/restore_windows"_q,
+		.title = tr::lng_settings_restore_windows(),
+		.checked = Core::App().savedWindows()->restoreOnLaunch(),
+		.keywords = {
+			u"restore"_q,
+			u"windows"_q,
+			u"launch"_q,
+			u"startup"_q,
+			u"reopen"_q,
+			u"session"_q,
+		},
+	});
+	if (restoreWindows) {
+		restoreWindows->checkedChanges(
+		) | rpl::filter([=](bool checked) {
+			return (checked != Core::App().savedWindows()->restoreOnLaunch());
+		}) | rpl::on_next([=](bool checked) {
+			Core::App().savedWindows()->setRestoreOnLaunch(checked);
+		}, restoreWindows->lifetime());
+	}
+
 	if (Platform::IsWindows() && !Platform::IsWindowsStoreBuild()) {
 		const auto sendto = builder.addCheckbox({
 			.id = u"advanced/sendto"_q,
@@ -673,7 +826,7 @@ void BuildANGLEOption(SectionBuilder &builder) {
 					if (index == backendIndex) {
 						return;
 					}
-					const auto confirmed = crl::guard(box, [=] {
+					const auto confirmed = [=] {
 						const auto nowDisabled = (index == disabled);
 						if (!nowDisabled) {
 							Ui::GL::ChangeANGLE([&] {
@@ -692,7 +845,7 @@ void BuildANGLEOption(SectionBuilder &builder) {
 							Local::writeSettings();
 						}
 						Core::Restart();
-					});
+					};
 					controller->show(Ui::MakeConfirmBox({
 						.text = tr::lng_settings_need_restart(),
 						.confirmed = confirmed,
@@ -798,7 +951,6 @@ void BuildSpellcheckerSection(SectionBuilder &builder) {
 	const auto session = builder.session();
 	const auto settings = &Core::App().settings();
 	const auto isSystem = Platform::Spellchecker::IsSystemSpellchecker();
-	const auto container = builder.container();
 
 	builder.addDivider();
 	builder.addSkip();
@@ -828,52 +980,37 @@ void BuildSpellcheckerSection(SectionBuilder &builder) {
 		}, spellchecker->lifetime());
 	}
 
-	const auto sliding = (!isSystem && container)
-		? container->add(
-			object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
-				container,
-				object_ptr<Ui::VerticalLayout>(container)))
-		: nullptr;
-	const auto inner = sliding ? sliding->entity() : nullptr;
-
 	if (!isSystem) {
-		const auto autoDownload = builder.addButton({
-			.id = u"advanced/auto_download_dictionaries"_q,
-			.title = tr::lng_settings_auto_download_dictionaries(),
-			.st = &st::settingsButtonNoIcon,
-			.container = inner,
-			.toggled = rpl::single(settings->autoDownloadDictionaries()),
-			.keywords = { u"dictionary"_q, u"download"_q, u"spellcheck"_q },
-		});
+		builder.scope([&] {
+			const auto autoDownload = builder.addButton({
+				.id = u"advanced/auto_download_dictionaries"_q,
+				.title = tr::lng_settings_auto_download_dictionaries(),
+				.st = &st::settingsButtonNoIcon,
+				.toggled = rpl::single(settings->autoDownloadDictionaries()),
+				.keywords = { u"dictionary"_q, u"download"_q, u"spellcheck"_q },
+			});
 
-		if (autoDownload) {
-			autoDownload->toggledValue(
-			) | rpl::filter([=](bool enabled) {
-				return (enabled != settings->autoDownloadDictionaries());
-			}) | rpl::on_next([=](bool enabled) {
-				settings->setAutoDownloadDictionaries(enabled);
-				Core::App().saveSettingsDelayed();
-			}, autoDownload->lifetime());
-		}
+			if (autoDownload) {
+				autoDownload->toggledValue(
+				) | rpl::filter([=](bool enabled) {
+					return (enabled != settings->autoDownloadDictionaries());
+				}) | rpl::on_next([=](bool enabled) {
+					settings->setAutoDownloadDictionaries(enabled);
+					Core::App().saveSettingsDelayed();
+				}, autoDownload->lifetime());
+			}
 
-		builder.addButton({
-			.id = u"advanced/manage_dictionaries"_q,
-			.title = tr::lng_settings_manage_dictionaries(),
-			.st = &st::settingsButtonNoIcon,
-			.container = inner,
-			.label = Spellchecker::ButtonManageDictsState(session),
-			.onClick = [=] {
-				controller->show(Box<Ui::ManageDictionariesBox>(session));
-			},
-			.keywords = { u"dictionary"_q, u"manage"_q, u"spellcheck"_q },
-		});
-
-		if (spellchecker && sliding) {
-			spellchecker->toggledValue(
-			) | rpl::on_next([=](bool enabled) {
-				sliding->toggle(enabled, anim::type::normal);
-			}, container->lifetime());
-		}
+			builder.addButton({
+				.id = u"advanced/manage_dictionaries"_q,
+				.title = tr::lng_settings_manage_dictionaries(),
+				.st = &st::settingsButtonNoIcon,
+				.label = Spellchecker::ButtonManageDictsState(session),
+				.onClick = [=] {
+					controller->show(Box<Ui::ManageDictionariesBox>(session));
+				},
+				.keywords = { u"dictionary"_q, u"manage"_q, u"spellcheck"_q },
+			});
+		}, spellchecker ? spellchecker->toggledValue() : nullptr);
 	}
 
 	builder.addSkip();
@@ -933,36 +1070,44 @@ void BuildUpdateSection(SectionBuilder &builder, bool atTop) {
 		label->setAttribute(Qt::WA_TransparentForMouseEvents);
 	}
 
-	const auto options = container
-		? container->add(
-			object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
-				container,
-				object_ptr<Ui::VerticalLayout>(container)))
-		: nullptr;
-	const auto inner = options ? options->entity() : nullptr;
-
-	const auto install = cAlphaVersion()
-		? nullptr
-		: builder.addButton({
-			.id = u"advanced/install_beta"_q,
-			.title = tr::lng_settings_install_beta(),
-			.st = &st::settingsButtonNoIcon,
-			.container = inner,
-			.toggled = rpl::single(cInstallBetaVersion()),
-			.keywords = { u"beta"_q, u"update"_q, u"version"_q },
+	auto optionsShown = rpl::producer<bool>(nullptr);
+	if (toggle) {
+		Core::UpdateChecker checker;
+		optionsShown = rpl::combine(
+			toggle->toggledValue(),
+			downloading->events_starting_with(
+				checker.state() == Core::UpdateChecker::State::Download)
+		) | rpl::map([](bool check, bool downloading) {
+			return check && !downloading;
 		});
+	}
+	auto options = (Ui::SlideWrap<Ui::VerticalLayout>*)nullptr;
+	auto install = (Ui::SettingsButton*)nullptr;
+	auto check = (Ui::SettingsButton*)nullptr;
+	builder.scope([&] {
+		install = (cAlphaVersion() || KSandbox::isInside())
+			? nullptr
+			: builder.addButton({
+				.id = u"advanced/install_beta"_q,
+				.title = tr::lng_settings_install_beta(),
+				.st = &st::settingsButtonNoIcon,
+				.toggled = rpl::single(cInstallBetaVersion()),
+				.keywords = { u"beta"_q, u"update"_q, u"version"_q },
+			});
 
-	const auto check = builder.addButton({
-		.id = u"advanced/check_update"_q,
-		.title = tr::lng_settings_check_now(),
-		.st = &st::settingsButtonNoIcon,
-		.container = inner,
-		.onClick = [] {
-			Core::UpdateChecker checker;
-			cSetLastUpdateCheck(0);
-			checker.start();
-		},
-		.keywords = { u"check"_q, u"update"_q, u"version"_q },
+		check = builder.addButton({
+			.id = u"advanced/check_update"_q,
+			.title = tr::lng_settings_check_now(),
+			.st = &st::settingsButtonNoIcon,
+			.onClick = [] {
+				Core::UpdateChecker checker;
+				cSetLastUpdateCheck(0);
+				checker.start();
+			},
+			.keywords = { u"check"_q, u"update"_q, u"version"_q },
+		});
+	}, std::move(optionsShown), [&](auto wrap) {
+		options = wrap;
 	});
 
 	if (check && container) {
@@ -976,11 +1121,32 @@ void BuildUpdateSection(SectionBuilder &builder, bool atTop) {
 			update->moveToLeft(0, 0);
 		}, update->lifetime());
 
-		const auto showDownloadProgress = [=](int64 ready, int64 total) {
+		const auto showDownloadProgress = [=](
+				int64 ready,
+				int64 total,
+				bool preferPercent) {
+			const auto formatted = [&] {
+				if (!preferPercent) {
+					return Ui::FormatDownloadText(ready, total);
+				}
+				const auto percent = (total > 0)
+					? std::clamp((ready * 100) / float64(total), 0., 100.)
+					: 0.;
+				auto result = QString::number(percent, 'f', 2);
+				if (result.contains('.')) {
+					while (result.endsWith('0')) {
+						result.chop(1);
+					}
+					if (result.endsWith('.')) {
+						result.chop(1);
+					}
+				}
+				return result + '%';
+			}();
 			texts->fire(tr::lng_settings_downloading_update(
 				tr::now,
 				lt_progress,
-				Ui::FormatDownloadText(ready, total)));
+				formatted));
 			downloading->fire(true);
 		};
 		const auto setDefaultStatus = [=](
@@ -989,7 +1155,10 @@ void BuildUpdateSection(SectionBuilder &builder, bool atTop) {
 			const auto state = checker.state();
 			switch (state) {
 			case State::Download:
-				showDownloadProgress(checker.already(), checker.size());
+				showDownloadProgress(
+					checker.already(),
+					checker.size(),
+					checker.percent());
 				break;
 			case State::Ready:
 				texts->fire(tr::lng_settings_update_ready(tr::now));
@@ -1033,13 +1202,6 @@ void BuildUpdateSection(SectionBuilder &builder, bool atTop) {
 		}
 
 		Core::UpdateChecker checker;
-		options->toggleOn(rpl::combine(
-			toggle->toggledValue(),
-			downloading->events_starting_with(
-				checker.state() == Core::UpdateChecker::State::Download)
-		) | rpl::map([](bool check, bool downloading) {
-			return check && !downloading;
-		}));
 
 		checker.checking() | rpl::on_next([=] {
 			options->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -1053,7 +1215,10 @@ void BuildUpdateSection(SectionBuilder &builder, bool atTop) {
 		}, options->lifetime());
 		checker.progress(
 		) | rpl::on_next([=](Core::UpdateChecker::Progress progress) {
-			showDownloadProgress(progress.already, progress.size);
+			showDownloadProgress(
+				progress.already,
+				progress.size,
+				progress.percent);
 		}, options->lifetime());
 		checker.failed() | rpl::on_next([=] {
 			options->setAttribute(Qt::WA_TransparentForMouseEvents, false);
@@ -1114,6 +1279,45 @@ void BuildExportSection(SectionBuilder &builder) {
 	});
 }
 
+void BuildScreenReaderSection(SectionBuilder &builder) {
+	const auto detected = base::ScreenReaderState::Instance()->active();
+	const auto disabled = Ui::ScreenReaderModeDisabled();
+	if (!detected || !disabled) {
+		return;
+	}
+
+	builder.addDivider();
+	builder.addSkip();
+	builder.addSubsectionTitle({
+		.id = u"advanced/screen_reader"_q,
+		.title = tr::lng_screen_reader_settings_title(),
+		.keywords = { u"screen reader"_q, u"accessibility"_q, u"voiceover"_q },
+	});
+
+	const auto toggle = builder.addButton({
+		.id = u"advanced/screen_reader_disable"_q,
+		.title = tr::lng_screen_reader_settings_disable(),
+		.st = &st::settingsButtonNoIcon,
+		.toggled = rpl::single(disabled),
+		.keywords = { u"screen reader"_q, u"accessibility"_q },
+	});
+
+	if (toggle) {
+		toggle->toggledValue(
+		) | rpl::filter([=](bool value) {
+			return (value != Ui::ScreenReaderModeDisabled());
+		}) | rpl::on_next([=](bool value) {
+			Core::App().settings().writePref<bool>(
+				Core::kScreenReaderModeDisabledKey,
+				value);
+			Core::App().saveSettingsDelayed();
+			Ui::SetScreenReaderModeDisabled(value);
+		}, toggle->lifetime());
+	}
+
+	builder.addSkip();
+}
+
 class Advanced : public Section<Advanced> {
 public:
 	Advanced(
@@ -1141,9 +1345,13 @@ const auto kMeta = BuildHelper({
 	BuildDataStorageSection(builder);
 	BuildAutoDownloadSection(builder);
 	BuildWindowTitleSection(builder);
+#if !defined Q_OS_WIN && !defined Q_OS_MAC
+	BuildWindowCloseBehaviorSection(builder);
+#endif
 	BuildSystemIntegrationSection(builder);
 	BuildPerformanceSection(builder);
 	BuildSpellcheckerSection(builder);
+	BuildScreenReaderSection(builder);
 	if (autoUpdate) {
 		BuildUpdateSection(builder, false);
 	}
@@ -1234,7 +1442,7 @@ void SetupUpdate(not_null<Ui::VerticalLayout*> container) {
 			container,
 			object_ptr<Ui::VerticalLayout>(container)));
 	const auto inner = options->entity();
-	const auto install = cAlphaVersion()
+	const auto install = (cAlphaVersion() || KSandbox::isInside())
 		? nullptr
 		: inner->add(object_ptr<Button>(
 			inner,
@@ -1265,11 +1473,32 @@ void SetupUpdate(not_null<Ui::VerticalLayout*> container) {
 	}, label->lifetime());
 	label->setAttribute(Qt::WA_TransparentForMouseEvents);
 
-	const auto showDownloadProgress = [=](int64 ready, int64 total) {
+	const auto showDownloadProgress = [=](
+			int64 ready,
+			int64 total,
+			bool preferPercent) {
+		const auto formatted = [&] {
+			if (!preferPercent) {
+				return Ui::FormatDownloadText(ready, total);
+			}
+			const auto percent = (total > 0)
+				? std::clamp((ready * 100) / float64(total), 0., 100.)
+				: 0.;
+			auto result = QString::number(percent, 'f', 2);
+			if (result.contains('.')) {
+				while (result.endsWith('0')) {
+					result.chop(1);
+				}
+				if (result.endsWith('.')) {
+					result.chop(1);
+				}
+			}
+			return result + '%';
+		}();
 		texts->fire(tr::lng_settings_downloading_update(
 			tr::now,
 			lt_progress,
-			Ui::FormatDownloadText(ready, total)));
+			formatted));
 		downloading->fire(true);
 	};
 	const auto setDefaultStatus = [=](const Core::UpdateChecker &checker) {
@@ -1277,7 +1506,10 @@ void SetupUpdate(not_null<Ui::VerticalLayout*> container) {
 		const auto state = checker.state();
 		switch (state) {
 		case State::Download:
-			showDownloadProgress(checker.already(), checker.size());
+			showDownloadProgress(
+				checker.already(),
+				checker.size(),
+				checker.percent());
 			break;
 		case State::Ready:
 			texts->fire(tr::lng_settings_update_ready(tr::now));
@@ -1345,7 +1577,10 @@ void SetupUpdate(not_null<Ui::VerticalLayout*> container) {
 	}, options->lifetime());
 	checker.progress(
 	) | rpl::on_next([=](Core::UpdateChecker::Progress progress) {
-		showDownloadProgress(progress.already, progress.size);
+		showDownloadProgress(
+			progress.already,
+			progress.size,
+			progress.percent);
 	}, options->lifetime());
 	checker.failed() | rpl::on_next([=] {
 		options->setAttribute(Qt::WA_TransparentForMouseEvents, false);
